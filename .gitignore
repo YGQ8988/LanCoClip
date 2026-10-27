@@ -1,0 +1,27 @@
+# 构建产物
+/dist/
+/.build/
+
+# 测试文件（不入库）
+*_test.go
+/testdata/
+
+# 与代码无关的隐藏目录（IDE / 工具自动生成）
+/.idea/
+/.vscode/
+/.workbuddy/
+/.codebuddy/
+
+# 编译出的可执行文件
+/lanoclip
+
+# macOS
+.DS_Store
+# AppleDouble 资源分叉文件（外置/网络卷上编辑时生成），会被 //go:embed 误收
+._*
+
+# 自签名代码签名证书（含私钥，绝不入库）
+/codesign/
+
+# Windows 资源对象（build-windows.sh 每次重新生成）
+/rsrc_windows_*.syso
