@@ -2,10 +2,6 @@
 /dist/
 /.build/
 
-# 测试文件（不入库）
-*_test.go
-/testdata/
-
 # 与代码无关的隐藏目录（IDE / 工具自动生成）
 /.idea/
 /.vscode/
