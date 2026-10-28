@@ -1,12 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"image"
+	_ "image/gif"  // 注册 GIF 解码器：手机相册选出来的图也可能是 GIF
+	_ "image/jpeg" // 注册 JPEG 解码器：iOS 相册上传的多为 JPEG
+	"image/png"
 	"io"
 	"log"
 	"net"
@@ -201,6 +206,8 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("/api/clear", s.handleClear)
 	mux.HandleFunc("/api/suppress", s.handleSuppress)
 	mux.HandleFunc("/api/image", s.handleImage)
+	mux.HandleFunc("/api/add-text", s.handleAddText)
+	mux.HandleFunc("/api/add-image", s.handleAddImage)
 	mux.HandleFunc("/api/qr", s.handleQR)
 	mux.HandleFunc("/api/settings", s.handleSettings)
 	mux.HandleFunc("/api/activate", s.handleActivate)
@@ -524,6 +531,134 @@ func (s *server) handleSuppress(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// ── 手机端推送：把手机上的文本 / 图片直接写进服务本机的记录 ───────────────
+// 与剪贴板捕获共用同一个 store，但不碰系统剪贴板，所以不需要 suppressor
+// 抑制：本机 lancoclipWatcher 不会因为这条记录再多记一次。
+const (
+	// maxAddTextBytes 限制单条推送文本，避免一次请求塞爆 store。
+	maxAddTextBytes = 512 << 10
+	// maxUploadBytes 限制上传图片的原始字节数。
+	maxUploadBytes = 32 << 20
+	// maxImagePixels 挡住极端尺寸（解码成 RGBA 会吃掉几百 MB 内存）；
+	// 4000×3000 的照片才 12MP，离这个上限还很远。
+	maxImagePixels = 40_000_000
+)
+
+// pngMagic is the fixed 8-byte signature every PNG starts with.
+var pngMagic = []byte("\x89PNG\r\n\x1a\n")
+
+// handleAddText records text pushed from any client — typically a phone.
+// Unlike /api/clear it is deliberately open to the LAN: sending something to
+// the PC is the whole point, and the PC's own lancoclip is untouched.
+func (s *server) handleAddText(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		return
+	}
+	var body struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxAddTextBytes)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad json"})
+		return
+	}
+	if strings.TrimSpace(body.Content) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "内容为空"})
+		return
+	}
+
+	added := s.store.AddText(body.Content)
+	if added {
+		log.Printf("added %d chars of text pushed from %s", len([]rune(body.Content)), r.RemoteAddr)
+		if err := s.store.Save(); err != nil {
+			log.Printf("save: %v", err)
+		}
+		tray.UpdateHistory(s.Recent(tray.HistoryCount))
+	}
+	// added=false：与最新一条重复，store 未变化（前端据此提示，不算失败）
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "added": added})
+}
+
+// handleAddImage stores an image picked on a phone (photo library or files)
+// as a new record. Uploads are normalised to PNG — the only format the store
+// keeps, since /api/image serves everything back as image/png.
+func (s *server) handleAddImage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "上传失败或图片过大"})
+		return
+	}
+	file, _, err := r.FormFile("image")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "缺少图片文件"})
+		return
+	}
+	defer file.Close()
+
+	raw, err := io.ReadAll(io.LimitReader(file, maxUploadBytes+1))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "读取图片失败"})
+		return
+	}
+	if len(raw) > maxUploadBytes {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "图片超过 32MB"})
+		return
+	}
+
+	data, err := toPNGBytes(raw)
+	if err != nil {
+		log.Printf("decode uploaded image: %v", err)
+		writeJSON(w, http.StatusUnsupportedMediaType, map[string]any{"error": "不支持的图片格式"})
+		return
+	}
+
+	added, err := s.store.AddImage(data)
+	if err != nil {
+		log.Printf("add uploaded image: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "保存图片失败"})
+		return
+	}
+	if added {
+		log.Printf("added image (%d KB) uploaded from %s", len(data)/1024, r.RemoteAddr)
+		if err := s.store.Save(); err != nil {
+			log.Printf("save: %v", err)
+		}
+		tray.UpdateHistory(s.Recent(tray.HistoryCount))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "added": added})
+}
+
+// toPNGBytes normalises an uploaded image to PNG. PNG input is passed through
+// untouched so a screenshot stays byte-identical; anything else (JPEG from a
+// phone's photo library, GIF…) is decoded and re-encoded.
+func toPNGBytes(raw []byte) ([]byte, error) {
+	if bytes.HasPrefix(raw, pngMagic) {
+		if _, err := png.DecodeConfig(bytes.NewReader(raw)); err == nil {
+			return raw, nil
+		}
+	}
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	if int64(cfg.Width)*int64(cfg.Height) > maxImagePixels {
+		return nil, errors.New("image too large")
+	}
+	img, _, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 func (s *server) handleQR(w http.ResponseWriter, r *http.Request) {
 	text := r.URL.Query().Get("text")
 	if text == "" {
@@ -633,8 +768,14 @@ func (s *server) currentShareURL() string {
 	return s.shareURL
 }
 
-// URL implements tray.App: the address the tray menu and hotkeys open.
+// URL implements tray.App: the LAN address a phone has to use.
 func (s *server) URL() string { return s.currentShareURL() }
+
+// LocalURL implements tray.App: the loopback address the tray menu opens.
+// Only the browser's own address changes — the QR rendered inside the page
+// still carries the LAN share URL — so the page becomes a secure context and
+// navigator.clipboard (needed to copy images) stops being undefined.
+func (s *server) LocalURL() string { return s.localURL() }
 
 // localURL is the page address on this machine itself. Unlike URL() it does not
 // depend on the LAN address, so it keeps working with no network at all — which

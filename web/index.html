@@ -97,7 +97,9 @@
   .hero-icon{width:76px;height:76px;display:block;margin:0 auto 10px;border-radius:20px;
              box-shadow:0 10px 24px var(--shadow);}
   header h1{font-size:20px;margin:0;letter-spacing:.5px;font-weight:600;}
-  .hero-desc{font-size:12.5px;color:var(--muted);margin:7px auto 0;line-height:1.55;white-space:nowrap;}
+  /* 顶部介绍：不强制单行（窄屏会溢出屏幕），但宽度要够放下一整句——
+     这句约 512px，上限给 760px，桌面端正好一行居中，手机端自然折行 */
+  .hero-desc{font-size:12.5px;color:var(--muted);margin:7px auto 0;line-height:1.55;max-width:760px;}
 
   /* 顶部 tab：文本 / 图片，位于访问地址卡片下方、与计数/清空同排 */
   .tabs{
@@ -334,6 +336,42 @@
   .hist-text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .hist-thumb{width:34px;height:34px;border-radius:8px;object-fit:cover;background:#fff;flex:0 0 auto;}
 
+  /* 手机端悬浮「添加」按钮：文本 tab = 写一条文本，图片 tab = 从相册/文件选图上传。
+     图标按 tab 切换（与主题按钮同一套路：两个 svg 二选一显示） */
+  .fab{
+    position:fixed;z-index:45;
+    right:calc(env(safe-area-inset-right) + 16px);
+    bottom:calc(env(safe-area-inset-bottom) + 24px);
+    width:54px;height:54px;border-radius:50%;
+    appearance:none;-webkit-appearance:none;
+    border:1px solid var(--stroke);
+    background:linear-gradient(135deg,var(--primary),var(--primary2));
+    color:#fff;display:flex;align-items:center;justify-content:center;
+    box-shadow:0 10px 26px var(--shadow);cursor:pointer;
+    transition:transform .08s ease;
+  }
+  .fab[hidden]{display:none;}
+  .fab:active{transform:scale(.94);}
+  /* 可拖动（挡住内容时挪开）：按住直接拖，位置记在 localStorage。
+     touch-action:none 必须加，否则手机上拖它会被当成页面滚动 */
+  .fab{cursor:grab;touch-action:none;-webkit-user-select:none;user-select:none;}
+  .fab.dragging{cursor:grabbing;transform:scale(1.06);transition:none;box-shadow:0 14px 34px var(--shadow);}
+  .fab svg{width:26px;height:26px;display:block;}
+  .fab .icon-image{display:none;}
+  .fab.pick-image .icon-text{display:none;}
+  .fab.pick-image .icon-image{display:block;}
+  /* 添加文本弹窗：右上角 × 关闭，底部「取消 / 添加」并排（取消在左） */
+  .add-card{text-align:left;max-width:360px;padding:22px 18px 18px;}
+  /* 标题右侧留出 × 的位置，避免长标题被压在关闭按钮下面 */
+  .add-card h2{font-size:15px;margin:0 44px 12px 0;}
+  .add-input{
+    width:100%;resize:vertical;font-family:inherit;font-size:15px;line-height:1.5;
+    color:var(--text);background:var(--glass);border:1px solid var(--stroke);
+    border-radius:12px;padding:10px 12px;outline:none;
+  }
+  .add-input:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(59,130,246,.20);}
+  .add-card .modal-actions{margin-top:12px;}
+
   .toast{
     position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom) + 30px);transform:translate(-50%,20px);
     background:var(--toast-bg);border:1px solid var(--stroke);color:var(--toast-text);font-size:14px;font-weight:500;
@@ -347,7 +385,7 @@
   <header>
     <img class="hero-icon" src="/appicon.png" alt="" width="76" height="76">
     <h1>剪贴板</h1>
-    <p class="hero-desc">电脑上复制一次，局域网内设备随时查看剪贴板记录</p>
+    <p class="hero-desc">自动留存电脑复制的文本与截图，局域网内随时查看、一键取回剪贴板，其他设备也能反向推送到电脑。</p>
   </header>
 
   <section class="card share">
@@ -488,6 +526,35 @@
 
   <div class="toast" id="toast"></div>
 
+  <!-- 手机端悬浮「添加」按钮：文本 tab 写文本，图片 tab 传图片（PC 端由 JS 移除） -->
+  <button class="fab" id="addBtn" type="button" hidden aria-label="添加">
+    <!-- 文本图标：一页文档 + 三行文字，与图片 tab 的「相框」图标成对 -->
+    <svg class="icon-text" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="5" y="3.5" width="14" height="17" rx="2.4"/>
+      <path d="M8.5 8.5h7M8.5 12h7M8.5 15.5h4"/>
+    </svg>
+    <svg class="icon-image" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3" y="4" width="18" height="16" rx="2.4"/>
+      <circle cx="8.6" cy="9.4" r="1.6"/>
+      <path d="M4 17.4l4.6-4.6 3.4 3.4 3-2.6 5 4.6"/>
+    </svg>
+  </button>
+  <!-- 图片 tab：唤起系统相册 / 文件管理器（iOS 会给出「照片图库 / 拍照 / 浏览」） -->
+  <input type="file" id="imagePicker" accept="image/*" hidden>
+
+  <div class="modal" id="addTextModal" hidden>
+    <div class="modal-card add-card" role="dialog" aria-modal="true" aria-label="添加文本">
+      <button class="modal-close" id="addTextClose" aria-label="关闭">&times;</button>
+      <h2>添加文本</h2>
+      <textarea id="addTextInput" class="add-input" rows="6"
+                placeholder="输入要发到电脑的内容，点「添加」发送"></textarea>
+      <div class="modal-actions">
+        <button class="btn block" id="addTextCancel" type="button">取消</button>
+        <button class="btn primary block" id="addTextSubmit" type="button">添加</button>
+      </div>
+    </div>
+  </div>
+
 <script>
 (function(){
   var listEl = document.getElementById('list');
@@ -534,10 +601,18 @@
   var historyClose = document.getElementById('historyClose');
   var histList = document.getElementById('histList');
   var histEmpty = document.getElementById('histEmpty');
+  var addBtn = document.getElementById('addBtn');
+  var imagePicker = document.getElementById('imagePicker');
+  var addTextModal = document.getElementById('addTextModal');
+  var addTextInput = document.getElementById('addTextInput');
+  var addTextSubmit = document.getElementById('addTextSubmit');
+  var addTextCancel = document.getElementById('addTextCancel');
+  var addTextClose = document.getElementById('addTextClose');
 
   var EMPTY_TEXT = { text: '暂无文本记录，去电脑上复制点内容试试', image: '暂无图片记录，去电脑上复制张图片试试' };
 
   var PAGE_SIZE = 10; // H5 每次上滑追加 10 条；PC 在下面按模式改成 32 条/页
+  var FAB_POS_KEY = 'lanoclip-fab-pos'; // 悬浮「添加」按钮拖动后的位置（视口 px）
 
   var state = {
     shareUrl:'', canClear:false, openIds:{},
@@ -583,6 +658,11 @@
     PAGE_SIZE = 32;
     listEl.classList.add('cols-4');
   }
+
+  // 右下角「添加」入口：手机是主要用法（手机本来没法往电脑剪贴板里写），
+  // PC 上同样保留——手动补一条文本 / 传一张图也用得上。
+  syncAddBtn();
+  applyFabPos();   // 恢复上次拖动到的位置
 
   // 切换卡（文本/图片 tabs）与访问地址卡片严格等宽，PC/H5 一致：测量 .share 的实际
   // 渲染宽度写入 --feed-w，CSS 用 width 消费。URL 长短因机器而异，动态测量才能永远对齐。
@@ -677,6 +757,9 @@
     var li = document.createElement('li');
     li.className = 'card item';
     li.dataset.id = r.id;   // 轮询去重：判断这条记录是否已在列表中
+    // 内容指纹：清空后 ID 会重新编号，光比 ID 认不出「同号不同内容」的陈旧条目
+    li.dataset.sum = r.imageSum || '';
+    if (!isImage) li.dataset.text = r.content || '';
 
     // 头部一行：时间 + 展开 + 复制/保存
     var head = document.createElement('div');
@@ -697,6 +780,14 @@
     head.appendChild(toggle);
 
     if (isImage){
+      // 写图片到剪贴板依赖 ClipboardItem，手机浏览器基本不支持，故只在桌面端给出「复制」
+      if (!isMobile){
+        var copyImg = document.createElement('button');
+        copyImg.className = 'btn sm';
+        copyImg.textContent = '复制';
+        copyImg.addEventListener('click', function(){ copyImageToLancoclip(r.id); });
+        head.appendChild(copyImg);
+      }
       var save = document.createElement('a');
       save.className = 'btn sm';
       save.textContent = '保存';
@@ -814,6 +905,7 @@
     state.sig = '';
     state.firstSig = '';
     state.openIds = {};
+    syncAddBtn();   // 悬浮按钮跟着 tab 换图标（+ → 图片）
     listEl.innerHTML = '';
     loadmoreEl.hidden = true;
     pagerEl.hidden = true;
@@ -955,6 +1047,15 @@
       onMeta(data);
 
       var sig = sigOf(data.records);
+      // 同步轮询用的「第 1 页签名」。切 tab 时 firstSig 被清空，如果这里不补上，
+      // 紧跟着的那次 poll 会以为数据变了、再拉一遍（切一次 tab 请求两次）。
+      // PC 只有在停在第 1 页时才有第 1 页的数据可比；H5 一次取的是多页，
+      // 取前 PAGE_SIZE 条才是第 1 页。
+      if (mode === 'pc'){
+        if (state.page === 1) state.firstSig = sig;
+      } else {
+        state.firstSig = sigOf((data.records || []).slice(0, PAGE_SIZE));
+      }
       if (force || sig !== state.sig){
         state.sig = sig;
         render(data.records, false);
@@ -968,14 +1069,18 @@
   function poll(){
     fetchPage(1, PAGE_SIZE).then(function(data){
       var sig = sigOf(data.records);
+      // 记录变少 = 电脑上清空了 / 上限淘汰了旧条目。此时不能只做增量插入：
+      // 消失的条目在 H5 上会一直挂在列表里（prependNewRecords 只增不删），
+      // 表现就是「电脑上清空了，手机上还显示着」——必须整屏重画。
+      var shrunk = data.total < state.total;
       if (sig !== state.firstSig || data.total !== state.total){
         state.firstSig = sig;
-        if (mode === 'pc' && state.page > 1){
-          onMeta(data);           // 只在别的页时只更新状态信息
-        } else if (mode === 'h5'){
-          prependNewRecords(data); // H5 增量插入，不清空、不动滚动位置
+        if (mode === 'h5' && !shrunk){
+          prependNewRecords(data);  // H5 增量插入，不清空、不动滚动位置
+        } else if (mode === 'pc' && state.page > 1 && !shrunk){
+          onMeta(data);             // 在别的页：只更新状态信息，不打断阅读
         } else {
-          loadView(false);
+          loadView(true);           // 有记录消失：全量重画（分页器也跟着刷新）
         }
       } else {
         onMeta(data);
@@ -989,16 +1094,25 @@
   function prependNewRecords(data){
     onMeta(data);
     state.total = data.total;
-    var known = {};
+    state.firstSig = sigOf(data.records || []);  // 已渲染的就是第 1 页，别让下次 poll 空转
+    var known = {}, byId = {};
     var nodes = listEl.children;
     for (var i = 0; i < nodes.length; i++){
       var id = nodes[i].dataset && nodes[i].dataset.id;
-      if (id) known[id] = true;
+      if (id){ known[id] = true; byId[id] = nodes[i]; }
     }
-    var fresh = [];
+    var fresh = [], stale = false;
     (data.records || []).forEach(function(r){
-      if (!known[r.id]) fresh.push(r);
+      var node = byId[r.id];
+      if (!node){ fresh.push(r); return; }
+      // 同 ID 但内容已经不是同一条：清空后 ID 会重新编号，只按 ID 去重会
+      // 把已被清掉的旧条目当成「已渲染」而漏掉新的——此时必须整屏重画。
+      var same = (r.kind === 'image')
+        ? (node.dataset.sum || '') === (r.imageSum || '')
+        : (node.dataset.text || '') === (r.content || '');
+      if (!same) stale = true;
     });
+    if (stale){ loadView(true); return; }
     if (fresh.length){
       // 服务端返回「最新在前」：倒序插入，最终 DOM 顺序才是「最新的在最上面」
       for (var i = fresh.length - 1; i >= 0; i--){
@@ -1230,14 +1344,46 @@
     // 与列表页一致：先上报抑制（本机复制不再入库），再写剪贴板
     suppress({ kind: 'image', id: id }).then(function(){
       fetch('/api/image?id=' + id).then(function(r){ return r.blob(); }).then(function(blob){
-        if (!navigator.clipboard || typeof ClipboardItem === 'undefined'){
-          toast('当前浏览器不支持复制图片'); return;
+        // navigator.clipboard 只在安全上下文存在：用 http://192.168.x.x 这类
+        // 局域网地址打开本页时它是 undefined（文本有 execCommand 兜底，图片没有）。
+        if (navigator.clipboard && window.isSecureContext && typeof ClipboardItem !== 'undefined'){
+          navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
+            .then(function(){ toast('图片已复制'); })
+            .catch(function(){ fallbackCopyImage(id); });   // 写入被拒也走兜底
+          return;
         }
-        return navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
-          .then(function(){ toast('图片已复制'); })
-          .catch(function(){ toast('复制图片失败'); });
+        fallbackCopyImage(id);
       }).catch(function(){ toast('复制图片失败'); });
     });
+  }
+
+  // 非安全上下文下的图片复制兜底：选中一张临时 <img> 再触发原生复制。
+  // Chromium 内核（Edge / Chrome）可用，Safari 不支持；都不行时给出可操作提示。
+  function fallbackCopyImage(id){
+    if (copyImageViaExecCommand(id)){ toast('图片已复制'); return; }
+    var local = location.protocol + '//127.0.0.1' + (location.port ? ':' + location.port : '');
+    toast('复制失败：改用 ' + local + ' 打开本页，或点「保存」下载原图');
+  }
+
+  function copyImageViaExecCommand(id){
+    try{
+      var box = document.createElement('div');
+      box.contentEditable = 'true';
+      box.style.cssText = 'position:fixed;left:-9999px;top:0;width:1px;height:1px;overflow:hidden;';
+      var img = document.createElement('img');
+      img.src = '/api/image?id=' + id;
+      box.appendChild(img);
+      document.body.appendChild(box);
+      var range = document.createRange();
+      range.selectNodeContents(box);
+      var sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      var ok = document.execCommand('copy');
+      sel.removeAllRanges();
+      document.body.removeChild(box);
+      return ok;
+    }catch(e){ return false; }
   }
 
   function openHistory(){
@@ -1286,6 +1432,172 @@
   historyClose.addEventListener('click', closeHistory);
   historyModal.addEventListener('click', function(e){ if (e.target === historyModal) closeHistory(); });
 
+  // ── 手机端「添加」：文本 tab 写一条，图片 tab 从相册/文件选一张 ──────
+  // 两条路都直接写进服务本机的记录（/api/add-text、/api/add-image），
+  // 不经过系统剪贴板，因此不需要向 /api/suppress 上报抑制。
+  function syncAddBtn(){
+    if (!addBtn) return;
+    var isImage = state.type === 'image';
+    addBtn.classList.toggle('pick-image', isImage);
+    var label = isImage ? '上传图片' : '添加文本';
+    addBtn.title = label;
+    addBtn.setAttribute('aria-label', label);
+    addBtn.hidden = false;
+  }
+
+  // ── 悬浮按钮拖动：挡住内容时挪开，位置存 localStorage ──────────
+  // 存的是视口内的 px 坐标，恢复时按当前窗口夹取，避免换设备 / 转屏 /
+  // 改窗口大小后按钮跑到屏幕外面。
+  function clampFab(x, y){
+    var w = addBtn.offsetWidth || 54, h = addBtn.offsetHeight || 54;
+    var maxX = Math.max(8, window.innerWidth - w - 8);
+    var maxY = Math.max(8, window.innerHeight - h - 8);
+    return [Math.min(Math.max(8, x), maxX), Math.min(Math.max(8, y), maxY)];
+  }
+
+  function setFabPos(x, y){
+    var p = clampFab(x, y);
+    addBtn.style.left = p[0] + 'px';
+    addBtn.style.top = p[1] + 'px';
+    addBtn.style.right = 'auto';   // 一旦手动定位就脱离右下角默认布局
+    addBtn.style.bottom = 'auto';
+    return p;
+  }
+
+  function applyFabPos(){
+    if (!addBtn) return;
+    var raw = null;
+    try { raw = localStorage.getItem(FAB_POS_KEY); } catch(e){ return; }
+    if (!raw) return;
+    var parts = raw.split(',');
+    var x = parseFloat(parts[0]), y = parseFloat(parts[1]);
+    if (!isFinite(x) || !isFinite(y)) return;
+    setFabPos(x, y);
+  }
+
+  function openAddText(){
+    addTextModal.hidden = false;
+    addTextInput.value = '';
+    // 弹窗刚显示时聚焦常被系统键盘顶掉，等一帧再聚焦更稳
+    setTimeout(function(){ addTextInput.focus(); }, 60);
+  }
+  function closeAddText(){ addTextModal.hidden = true; }
+
+  // 新记录一定排在最上面：H5 走增量插入后回到顶部，PC 直接重拉当前页
+  function afterAdd(){
+    if (mode === 'h5'){
+      state.firstSig = '';   // 清空签名，下一轮 poll 才会判定「有新数据」
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      poll();
+    } else {
+      state.sig = '';
+      loadView(true);
+    }
+  }
+
+  function readJSON(r){
+    // 统一收口：非 JSON 响应也不至于让 .then 链断掉
+    return r.json().catch(function(){ return {}; }).then(function(j){ return { ok: r.ok, j: j }; });
+  }
+
+  function submitAddText(){
+    var content = addTextInput.value;
+    if (!content.trim()){ toast('请输入内容'); return; }
+    addTextSubmit.disabled = true;
+    fetch('/api/add-text', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: content })
+    }).then(readJSON).then(function(res){
+      addTextSubmit.disabled = false;
+      if (!res.ok){ toast(res.j.error || '添加失败'); return; }
+      closeAddText();
+      // added=false：与最新一条重复，store 没变，不算失败
+      toast(res.j.added === false ? '与最新一条重复' : '已添加到电脑');
+      afterAdd();
+    }).catch(function(){
+      addTextSubmit.disabled = false;
+      toast('添加失败');
+    });
+  }
+
+  function uploadImage(file){
+    if (file.size > 32 * 1024 * 1024){ toast('图片超过 32MB'); return; }
+    var fd = new FormData();
+    fd.append('image', file, file.name || 'upload.png');
+    toast('上传中…');
+    fetch('/api/add-image', { method: 'POST', body: fd })
+      .then(readJSON).then(function(res){
+        if (!res.ok){ toast(res.j.error || '上传失败'); return; }
+        toast(res.j.added === false ? '与最新一条重复' : '图片已上传');
+        afterAdd();
+      }).catch(function(){ toast('上传失败'); });
+  }
+
+  if (addBtn){
+    // 拖动状态：按下记起点，移动超过阈值才算拖动（否则当成点击）。
+    // pointer 事件同时覆盖鼠标与触摸；setPointerCapture 保证手指/鼠标移出
+    // 按钮后仍然收得到 move/up。
+    var fabDrag = null;
+    var fabMoved = false;
+
+    addBtn.addEventListener('pointerdown', function(e){
+      if (e.button != null && e.button !== 0) return;   // 只响应左键 / 触摸
+      fabMoved = false;
+      var r = addBtn.getBoundingClientRect();
+      fabDrag = { id: e.pointerId, dx: e.clientX - r.left, dy: e.clientY - r.top,
+                  sx: e.clientX, sy: e.clientY, x: r.left, y: r.top, moved: false };
+      try { addBtn.setPointerCapture(e.pointerId); } catch(err){}
+    });
+
+    addBtn.addEventListener('pointermove', function(e){
+      if (!fabDrag || e.pointerId !== fabDrag.id) return;
+      if (!fabDrag.moved &&
+          Math.abs(e.clientX - fabDrag.sx) + Math.abs(e.clientY - fabDrag.sy) < 6) return;
+      fabDrag.moved = true;
+      addBtn.classList.add('dragging');
+      fabDrag.x = e.clientX - fabDrag.dx;
+      fabDrag.y = e.clientY - fabDrag.dy;
+      setFabPos(fabDrag.x, fabDrag.y);
+      if (e.cancelable) e.preventDefault();   // 手机上别把拖动当成页面滚动
+    });
+
+    function endFabDrag(e){
+      if (!fabDrag || (e && e.pointerId !== fabDrag.id)) return;
+      var moved = fabDrag.moved, x = fabDrag.x, y = fabDrag.y;
+      fabDrag = null;
+      addBtn.classList.remove('dragging');
+      if (!moved) return;
+      fabMoved = true;              // 让随后的 click 失效（点击与拖动区分开）
+      var p = setFabPos(x, y);      // 松手时再夹一次并落到最终位置
+      try { localStorage.setItem(FAB_POS_KEY, p[0] + ',' + p[1]); } catch(err){}
+    }
+    addBtn.addEventListener('pointerup', endFabDrag);
+    addBtn.addEventListener('pointercancel', endFabDrag);
+
+    addBtn.addEventListener('click', function(){
+      if (fabMoved){ fabMoved = false; return; }   // 刚刚是拖动，不是点击
+      if (state.type === 'image'){
+        imagePicker.value = '';  // 清掉旧值，否则连续选同一张不再触发 change
+        imagePicker.click();
+      } else {
+        openAddText();
+      }
+    });
+
+    // 窗口尺寸变化（转屏 / 改窗口）后把按钮拉回可视区域
+    window.addEventListener('resize', applyFabPos);
+  }
+  imagePicker.addEventListener('change', function(){
+    var f = imagePicker.files && imagePicker.files[0];
+    if (f) uploadImage(f);
+  });
+  addTextSubmit.addEventListener('click', submitAddText);
+  // 取消 / 右上角 × / 点遮罩：三个关闭入口，行为一致
+  addTextCancel.addEventListener('click', closeAddText);
+  addTextClose.addEventListener('click', closeAddText);
+  addTextModal.addEventListener('click', function(e){ if (e.target === addTextModal) closeAddText(); });
+
   // ── 亮色 / 暗色切换 ────────────────────────────────────────
   // 默认跟随系统（首帧由 head 内联脚本决定）；用户手动点过按钮后，
   // 选择存入 localStorage，此后按用户设置展示、不再跟随系统变化。
@@ -1328,7 +1640,8 @@
   document.addEventListener('keydown', function(e){
     if (e.key !== 'Escape') return;
     if (hkCapture) return;
-    if (!settingsModal.hidden) closeSettings();
+    if (!addTextModal.hidden) closeAddText();
+    else if (!settingsModal.hidden) closeSettings();
     else if (!historyModal.hidden) closeHistory();
     else if (!modal.hidden) closeModal();
   });

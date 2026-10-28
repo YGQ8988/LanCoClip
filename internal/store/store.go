@@ -78,14 +78,19 @@ type Record struct {
 //	<dir>/images/*.png   图片原图
 //	<dir>/settings.json  保留条数配置（可运行时修改）
 type Store struct {
-	mu       sync.RWMutex
-	dir      string
-	imgDir   string
-	nextID   int64
-	texts    []Record
-	images   []Record
-	maxText  int // 文本保留条数上限（可配置）
-	maxImage int // 图片保留条数上限（可配置）
+	mu     sync.RWMutex
+	dir    string
+	imgDir string
+	// 文本与图片各自编号：清空某一类时，只有那一类的 ID 从 1 重新数。
+	// 代价是跨类型 ID 可能相同（文本 1 和图片 1 并存）——所有按 ID 的查询
+	// 都限定在同类型内（ImagePath / ImageSum 只查图片，托盘复制文本用的是
+	// 内容而不是 ID），所以不会串号。
+	nextTextID  int64
+	nextImageID int64
+	texts       []Record
+	images      []Record
+	maxText     int // 文本保留条数上限（可配置）
+	maxImage    int // 图片保留条数上限（可配置）
 	// 全局快捷键（canonical 组合串，空 = 平台默认，见 HotkeyQR/HistHistory）
 	hotkeyQR      string
 	hotkeyHistory string
@@ -117,11 +122,12 @@ func NewStore(dir string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		dir:      dir,
-		imgDir:   imgDir,
-		nextID:   1,
-		maxText:  DefaultMaxTextRecords,
-		maxImage: DefaultMaxImageRecords,
+		dir:         dir,
+		imgDir:      imgDir,
+		nextTextID:  1,
+		nextImageID: 1,
+		maxText:     DefaultMaxTextRecords,
+		maxImage:    DefaultMaxImageRecords,
 	}
 	s.load()
 	return s, nil
@@ -151,13 +157,18 @@ func (s *Store) load() {
 		}
 	}
 
+	// 两类各按各的现有 ID 续号（历史数据里文本 / 图片的号段本来就各自独立）
 	for _, list := range [][]Record{s.texts, s.images} {
 		for i := range list {
 			if list[i].Kind == "" {
 				list[i].Kind = KindText
 			}
-			if list[i].ID >= s.nextID {
-				s.nextID = list[i].ID + 1
+			if list[i].Kind == KindImage {
+				if list[i].ID >= s.nextImageID {
+					s.nextImageID = list[i].ID + 1
+				}
+			} else if list[i].ID >= s.nextTextID {
+				s.nextTextID = list[i].ID + 1
 			}
 		}
 	}
@@ -258,7 +269,7 @@ func (s *Store) AddImage(png []byte) (bool, error) {
 		return false, nil
 	}
 
-	id := s.nextID
+	id := s.nextImageID
 	name := fmt.Sprintf("%d.png", id)
 	if err := os.WriteFile(filepath.Join(s.imgDir, name), png, 0o644); err != nil {
 		return false, err
@@ -269,16 +280,24 @@ func (s *Store) AddImage(png []byte) (bool, error) {
 }
 
 // newRecord mints a record with a fresh id and timestamp. Callers hold s.mu.
+// 文本 / 图片各取各的号段，所以 ID 只在同类型内唯一。
 func (s *Store) newRecord(kind, content, image, sum string) Record {
+	var id int64
+	if kind == KindImage {
+		id = s.nextImageID
+		s.nextImageID++
+	} else {
+		id = s.nextTextID
+		s.nextTextID++
+	}
 	r := Record{
-		ID:        s.nextID,
+		ID:        id,
 		Kind:      kind,
 		Content:   content,
 		Image:     image,
 		ImageSum:  sum,
 		CreatedAt: time.Now().UnixMilli(),
 	}
-	s.nextID++
 	return r
 }
 
@@ -540,14 +559,18 @@ func (s *Store) Clear(kind string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// 清空某一类时，那一类的 ID 从 1 重新数（用户的直观预期：「清了就该从 1 开始」）。
+	// 两类各有一个号段，所以清图片不影响文本继续往后编号，反之亦然。
 	if kind == "" || kind == KindImage {
 		for _, r := range s.images {
 			s.removeImageFile(r)
 		}
 		s.images = nil
+		s.nextImageID = 1
 	}
 	if kind == "" || kind == KindText {
 		s.texts = nil
+		s.nextTextID = 1
 	}
 	s.dirty = true
 }

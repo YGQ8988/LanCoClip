@@ -77,7 +77,7 @@ func run(app App, confirmClear func() bool, openURL func(string), opts Options) 
 	//   macOS command+shift+V / Windows ctrl+shift+V → 原生菜单弹出最近
 	//   30 条历史（不唤起浏览器），点击复制回剪贴板；弹不出来时回退打开页面
 	if err := hotkey.Install(
-		func() { openURL(withParam(app.URL(), "qr=1")) },
+		func() { openURL(withParam(app.LocalURL(), "qr=1")) },
 		func() { showHistoryPopupGuarded(app, openURL) },
 		opts.HotkeyQR, opts.HotkeyHistory,
 	); err != nil {
@@ -90,7 +90,7 @@ func run(app App, confirmClear func() bool, openURL func(string), opts Options) 
 	go func() {
 		time.Sleep(startupNotifyDelay)
 		if err := notify.Notify("LanCoClip已就绪", "点击打开剪贴板记录页面", func() {
-			openURL(app.URL())
+			openURL(app.LocalURL())
 		}); err != nil {
 			logf("startup notification: %v", err)
 		}
@@ -119,9 +119,9 @@ func run(app App, confirmClear func() bool, openURL func(string), opts Options) 
 		for {
 			select {
 			case <-mOpen.ClickedCh:
-				openURL(app.URL())
+				openURL(app.LocalURL())
 			case <-mSettings.ClickedCh:
-				u := app.URL()
+				u := app.LocalURL()
 				if u != "" && !strings.Contains(u, "?") {
 					u += "?settings=1"
 				}
@@ -170,7 +170,7 @@ func showHistoryPopup(app App, openURL func(string)) {
 		// 没有记录时弹个提示，避免按下快捷键毫无反馈
 		hint := []histpop.Group{{Title: "（空）暂无剪贴板记录"}}
 		if !histpop.Show(hint, nil) {
-			openURL(withParam(app.URL(), "history=1"))
+			openURL(withParam(app.LocalURL(), "history=1"))
 		}
 		return
 	}
@@ -185,7 +185,7 @@ func showHistoryPopup(app App, openURL func(string)) {
 		copyAndPaste(app, items[idx])
 	})
 	if !shown {
-		openURL(withParam(app.URL(), "history=1"))
+		openURL(withParam(app.LocalURL(), "history=1"))
 	}
 }
 

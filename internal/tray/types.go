@@ -12,8 +12,12 @@ type Item struct {
 
 // App is what the tray menu needs from the host application.
 type App interface {
-	// URL is the address of the web page ("打开页面" / "设置").
+	// URL is the LAN address of the web page (what a phone has to use).
 	URL() string
+	// LocalURL is the same page over loopback (http://127.0.0.1:port). Menu
+	// actions open this one: a loopback page is a secure context, so the async
+	// Clipboard API — which copying an image requires — is actually available.
+	LocalURL() string
 	// Recent returns up to n newest history items (text + image merged).
 	Recent(n int) []Item
 	// CopyItem puts a history item back onto the lancoclip.

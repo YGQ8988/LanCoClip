@@ -1,8 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/jpeg"
+	"image/png"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -746,5 +751,125 @@ func TestCanClearAfterNetworkSwitch(t *testing.T) {
 	}
 	if !s.canClear(r) {
 		t.Fatalf("canClear from current LAN IP %s = false, want true", cur)
+	}
+}
+
+// 手机端推送：/api/add-text 与 /api/add-image。
+// 这两个接口故意对局域网开放（不像 /api/clear 只认本机）——手机能往电脑上
+// 写记录正是它的用途，且全程不碰系统剪贴板，不会让本机 watcher 重复记录。
+func TestHandleAddFromPhone(t *testing.T) {
+	s := &server{
+		store:      newTestStore(t),
+		suppressor: lancoclip.NewSuppressor(),
+		localIPs:   map[string]bool{},
+		shareURL:   "http://192.168.1.10:6116",
+	}
+	phoneUA := "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile/15E148"
+
+	postText := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/add-text", strings.NewReader(body))
+		req.RemoteAddr = "192.168.1.99:5000" // 手机：非本机地址
+		req.Header.Set("User-Agent", phoneUA)
+		rec := httptest.NewRecorder()
+		s.handleAddText(rec, req)
+		return rec
+	}
+	decode := func(rec *httptest.ResponseRecorder) map[string]any {
+		var out map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("bad json (%s): %v", rec.Body.String(), err)
+		}
+		return out
+	}
+
+	// 手机也能写：200 且确实入库
+	rec := postText(`{"content":"来自手机的文本"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("phone add text = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	if decode(rec)["added"] != true {
+		t.Fatalf("first add should report added=true: %s", rec.Body.String())
+	}
+	// 相邻重复：added=false，但不是错误
+	if out := decode(postText(`{"content":"来自手机的文本"}`)); out["added"] != false {
+		t.Fatalf("duplicate add should report added=false: %v", out)
+	}
+	if postText(`{"content":"   "}`).Code != http.StatusBadRequest {
+		t.Fatal("blank content should be 400")
+	}
+	getReq := httptest.NewRequest(http.MethodGet, "/api/add-text", nil)
+	getRec := httptest.NewRecorder()
+	s.handleAddText(getRec, getReq)
+	if getRec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /api/add-text = %d, want 405", getRec.Code)
+	}
+
+	// ── 图片上传 ──
+	upload := func(name string, data []byte) *httptest.ResponseRecorder {
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		fw, err := mw.CreateFormFile("image", name)
+		if err != nil {
+			t.Fatalf("CreateFormFile: %v", err)
+		}
+		if _, err := fw.Write(data); err != nil {
+			t.Fatalf("write part: %v", err)
+		}
+		if err := mw.Close(); err != nil {
+			t.Fatalf("close multipart: %v", err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/add-image", &buf)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		req.RemoteAddr = "192.168.1.99:5000"
+		req.Header.Set("User-Agent", phoneUA)
+		rec := httptest.NewRecorder()
+		s.handleAddImage(rec, req)
+		return rec
+	}
+
+	// 相册里挑出来的 JPEG：必须转成 PNG 入库（/api/image 统一按 image/png 输出）
+	var jpg bytes.Buffer
+	if err := jpeg.Encode(&jpg, image.NewRGBA(image.Rect(0, 0, 4, 4)), nil); err != nil {
+		t.Fatalf("encode test jpeg: %v", err)
+	}
+	rec = upload("photo.jpg", jpg.Bytes())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("jpeg upload = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	if decode(rec)["added"] != true {
+		t.Fatalf("jpeg upload should add: %s", rec.Body.String())
+	}
+	// 同一张再传 → added=false
+	if out := decode(upload("photo.jpg", jpg.Bytes())); out["added"] != false {
+		t.Fatalf("duplicate image should report added=false: %v", out)
+	}
+	// 非图片 → 415
+	if rec := upload("notes.txt", []byte("definitely not an image")); rec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("non-image upload = %d, want 415", rec.Code)
+	}
+	// 表单里没有 image 字段 → 400
+	empty := httptest.NewRequest(http.MethodPost, "/api/add-image", strings.NewReader(""))
+	empty.Header.Set("Content-Type", "multipart/form-data; boundary=zzz")
+	emptyRec := httptest.NewRecorder()
+	s.handleAddImage(emptyRec, empty)
+	if emptyRec.Code != http.StatusBadRequest {
+		t.Fatalf("form without image = %d, want 400", emptyRec.Code)
+	}
+
+	// 落盘的必须是合法 PNG
+	recs, _ := s.store.Page(store.KindImage, 1, 10)
+	if len(recs) != 1 {
+		t.Fatalf("image records = %d, want 1", len(recs))
+	}
+	path, ok := s.store.ImagePath(recs[0].ID)
+	if !ok {
+		t.Fatal("ImagePath missing for the uploaded record")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read stored image: %v", err)
+	}
+	if _, err := png.Decode(bytes.NewReader(raw)); err != nil {
+		t.Fatalf("stored image is not a valid PNG: %v", err)
 	}
 }

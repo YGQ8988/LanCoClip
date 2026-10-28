@@ -238,6 +238,79 @@ func TestStoreTextAndImages(t *testing.T) {
 	}
 }
 
+// 文本 / 图片各有一个号段：清空哪一类，那一类的 ID 就从 1 重新数，
+// 另一类继续往后编号，互不影响（图片文件名 = <id>.png，清空时旧文件已删，
+// 所以重号不会覆盖还在用的图）。
+func TestClearRestartsIDsPerKind(t *testing.T) {
+	s := newTestStore(t)
+	for i := 1; i <= 3; i++ {
+		s.AddText(fmt.Sprintf("t%d", i))
+		if added, err := s.AddImage([]byte{0x89, 'P', 'N', 'G', byte(i)}); !added || err != nil {
+			t.Fatalf("AddImage %d = (%v, %v)", i, added, err)
+		}
+	}
+	// 两类各自编号，所以最新的文本 / 图片 ID 都是 3
+	texts, _ := s.Page(KindText, 1, 10)
+	imgs, _ := s.Page(KindImage, 1, 10)
+	if texts[0].ID != 3 || imgs[0].ID != 3 {
+		t.Fatalf("ids should be independent per kind, got text=%d image=%d", texts[0].ID, imgs[0].ID)
+	}
+
+	// 只清图片：图片回到 1，文本继续到 4
+	s.Clear(KindImage)
+	if added, _ := s.AddImage([]byte{0x89, 'P', 'N', 'G', 9}); !added {
+		t.Fatal("AddImage after clearing images failed")
+	}
+	s.AddText("t4")
+	texts, _ = s.Page(KindText, 1, 10)
+	imgs, _ = s.Page(KindImage, 1, 10)
+	if imgs[0].ID != 1 {
+		t.Fatalf("image id should restart at 1 after clearing images, got %d", imgs[0].ID)
+	}
+	if texts[0].ID != 4 {
+		t.Fatalf("text id should keep counting (4), got %d", texts[0].ID)
+	}
+	// 新图片写入的是清空后空出来的 1.png，内容必须是新这张
+	p, ok := s.ImagePath(imgs[0].ID)
+	if !ok {
+		t.Fatal("new image record should resolve to a file")
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("read image: %v", err)
+	}
+	if len(raw) == 0 || raw[len(raw)-1] != 9 {
+		t.Fatalf("1.png should hold the newly uploaded image, got %v", raw)
+	}
+
+	// 只清文本：文本回到 1，图片继续到 2
+	s.Clear(KindText)
+	s.AddText("t1-again")
+	if added, _ := s.AddImage([]byte{0x89, 'P', 'N', 'G', 8}); !added {
+		t.Fatal("AddImage after clearing texts failed")
+	}
+	texts, _ = s.Page(KindText, 1, 10)
+	imgs, _ = s.Page(KindImage, 1, 10)
+	if texts[0].ID != 1 {
+		t.Fatalf("text id should restart at 1 after clearing texts, got %d", texts[0].ID)
+	}
+	if imgs[0].ID != 2 {
+		t.Fatalf("image id should keep counting (2), got %d", imgs[0].ID)
+	}
+
+	// 清空全部：两类都回到 1
+	s.Clear("")
+	s.AddText("fresh")
+	if added, _ := s.AddImage([]byte{0x89, 'P', 'N', 'G', 7}); !added {
+		t.Fatal("AddImage after clearing everything failed")
+	}
+	texts, _ = s.Page(KindText, 1, 10)
+	imgs, _ = s.Page(KindImage, 1, 10)
+	if texts[0].ID != 1 || imgs[0].ID != 1 {
+		t.Fatalf("after clearing everything both ids should be 1, got text=%d image=%d", texts[0].ID, imgs[0].ID)
+	}
+}
+
 // 保留条数可配置：调小后立即从最旧端修剪，图片连文件一起删。
 func TestStoreSetLimitsTrimsOldestFirst(t *testing.T) {
 	s := newTestStore(t)
