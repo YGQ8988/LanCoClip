@@ -33,10 +33,8 @@ func WriteImage(png []byte) error {
 	if len(png) == 0 {
 		return errors.New("empty image")
 	}
-	var p *C.char
-	if len(png) > 0 {
-		p = (*C.char)(unsafe.Pointer(&png[0]))
-	}
+	// len(png) is guaranteed > 0 here: the guard above returns on empty input.
+	p := (*C.char)(unsafe.Pointer(&png[0]))
 	switch C.writeLancoclipPNG(p, C.int(len(png))) {
 	case 0:
 		return nil

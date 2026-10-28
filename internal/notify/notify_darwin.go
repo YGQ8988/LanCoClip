@@ -20,8 +20,8 @@ import (
 )
 
 var (
-	clickMu  sync.Mutex
-	clickFn  func()
+	clickMu   sync.Mutex
+	clickFn   func()
 	delivered bool // at least one Notify call got through, so clicks may arrive
 )
 

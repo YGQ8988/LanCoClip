@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strings"
 
+	"lanoclip/internal/open"
 	"lanoclip/internal/systray"
 	"lanoclip/internal/winhide"
 )
@@ -22,7 +23,7 @@ func Run(app App, opts Options) {
 	systray.Run(func() {
 		systray.SetIcon(menuIconICO) // Windows 需要 .ico
 		systray.SetTooltip("剪贴板")
-		run(app, confirmClearAll, openBrowser, opts)
+		run(app, confirmClearAll, open.Open, opts)
 	}, func() {})
 }
 
@@ -41,12 +42,3 @@ func confirmClearAll() bool {
 
 // Quit asks the tray loop to stop.
 func Quit() { systray.Quit() }
-
-// openBrowser opens url in the default browser. rundll32 avoids the console
-// window flash that `cmd /c start` causes in a GUI-subsystem binary, and
-// hideCmd removes rundll32's own console flash.
-func openBrowser(url string) {
-	cmd := exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
-	winhide.Hide(cmd)
-	_ = cmd.Start()
-}

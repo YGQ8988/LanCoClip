@@ -1,7 +1,6 @@
 package store
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -88,47 +87,6 @@ func TestStoreKindsAreIndependent(t *testing.T) {
 	s.Clear(KindImage)
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatal("clearing images should delete the files")
-	}
-}
-
-// 老的单文件布局 history.json 应被拆分迁移到 texts.json / images.json。
-func TestStoreMigratesLegacyHistory(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, "images"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	legacy := []Record{
-		{ID: 1, Kind: KindText, Content: "old text", CreatedAt: 111},
-		{ID: 2, Kind: KindImage, Image: "2.png", ImageSum: "x", CreatedAt: 222},
-		{ID: 3, Content: "no kind field", CreatedAt: 333}, // 老数据没有 kind
-	}
-	data, _ := json.MarshalIndent(legacy, "", "  ")
-	if err := os.WriteFile(filepath.Join(dir, "history.json"), data, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	s, err := NewStore(dir)
-	if err != nil {
-		t.Fatalf("NewStore: %v", err)
-	}
-	tc, ic := s.Counts()
-	if tc != 2 || ic != 1 {
-		t.Fatalf("migrated counts = %d/%d, want 2/1", tc, ic)
-	}
-	for _, f := range []string{"texts.json", "images.json"} {
-		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
-			t.Fatalf("%s not written: %v", f, err)
-		}
-	}
-	if _, err := os.Stat(filepath.Join(dir, "history.json.migrated")); err != nil {
-		t.Fatalf("legacy history.json should be renamed: %v", err)
-	}
-
-	// 迁移后新的记录应继续追加到对应类型
-	s.AddText("after migrate")
-	tc, _ = s.Counts()
-	if tc != 3 {
-		t.Fatalf("texts after migrate = %d, want 3", tc)
 	}
 }
 

@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"lanoclip/internal/store"
 )
 
 // Windows 全局快捷键：user32 RegisterHotKey 注册到当前线程，GetMessage 循环
@@ -113,7 +115,7 @@ func registerPair(specs [2]comboSpec) error {
 // locked OS thread. Non-fatal: failures (e.g. hotkey already taken) are
 // reported through the returned error but do not stop startup.
 func Install(onQRFn, onHistoryFn func(), qrCombo, histCombo string) error {
-	specs, err := resolvePair(qrCombo, histCombo, "ctrl+shift+q", "ctrl+shift+v")
+	specs, err := resolvePair(qrCombo, histCombo, store.DefaultHotkeyQR(), store.DefaultHotkeyHistory())
 	if err != nil {
 		return err
 	}
@@ -199,7 +201,7 @@ func doReregister(specs [2]comboSpec) error {
 // are returned synchronously; registration happens on the hotkey message
 // loop thread and its result is awaited (bounded). No-op before Install.
 func Update(qrCombo, histCombo string) error {
-	specs, err := resolvePair(qrCombo, histCombo, "ctrl+shift+q", "ctrl+shift+v")
+	specs, err := resolvePair(qrCombo, histCombo, store.DefaultHotkeyQR(), store.DefaultHotkeyHistory())
 	if err != nil {
 		return err
 	}

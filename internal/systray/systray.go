@@ -4,7 +4,6 @@ Package systray is a cross-platform Go library to place an icon and menu in the 
 package systray
 
 import (
-	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -75,13 +74,6 @@ type MenuItem struct {
 	parent *MenuItem
 }
 
-func (item *MenuItem) String() string {
-	if item.parent == nil {
-		return fmt.Sprintf("MenuItem[%d, %q]", item.id, item.title)
-	}
-	return fmt.Sprintf("MenuItem[%d, parent %d, %q]", item.id, item.parent.id, item.title)
-}
-
 // newMenuItem returns a populated MenuItem object
 func newMenuItem(title string, tooltip string, parent *MenuItem) *MenuItem {
 	return &MenuItem{
@@ -138,20 +130,8 @@ func Quit() {
 
 // AddMenuItem adds a menu item with the designated title and tooltip.
 // It can be safely invoked from different goroutines.
-// Created menu items are checkable on Windows and OSX by default. For Linux you have to use AddMenuItemCheckbox
 func AddMenuItem(title string, tooltip string) *MenuItem {
 	item := newMenuItem(title, tooltip, nil)
-	item.update()
-	return item
-}
-
-// AddMenuItemCheckbox adds a menu item with the designated title and tooltip and a checkbox for Linux.
-// It can be safely invoked from different goroutines.
-// On Windows and OSX this is the same as calling AddMenuItem
-func AddMenuItemCheckbox(title string, tooltip string, checked bool) *MenuItem {
-	item := newMenuItem(title, tooltip, nil)
-	item.isCheckable = true
-	item.checked = checked
 	item.update()
 	return item
 }
@@ -163,20 +143,8 @@ func AddSeparator() {
 
 // AddSubMenuItem adds a nested sub-menu item with the designated title and tooltip.
 // It can be safely invoked from different goroutines.
-// Created menu items are checkable on Windows and OSX by default. For Linux you have to use AddSubMenuItemCheckbox
 func (item *MenuItem) AddSubMenuItem(title string, tooltip string) *MenuItem {
 	child := newMenuItem(title, tooltip, item)
-	child.update()
-	return child
-}
-
-// AddSubMenuItemCheckbox adds a nested sub-menu item with the designated title and tooltip and a checkbox for Linux.
-// It can be safely invoked from different goroutines.
-// On Windows and OSX this is the same as calling AddSubMenuItem
-func (item *MenuItem) AddSubMenuItemCheckbox(title string, tooltip string, checked bool) *MenuItem {
-	child := newMenuItem(title, tooltip, item)
-	child.isCheckable = true
-	child.checked = checked
 	child.update()
 	return child
 }
@@ -191,11 +159,6 @@ func (item *MenuItem) SetTitle(title string) {
 func (item *MenuItem) SetTooltip(tooltip string) {
 	item.tooltip = tooltip
 	item.update()
-}
-
-// Disabled checks if the menu item is disabled
-func (item *MenuItem) Disabled() bool {
-	return item.disabled
 }
 
 // Enable a menu item regardless if it's previously enabled or not
@@ -218,23 +181,6 @@ func (item *MenuItem) Hide() {
 // Show shows a previously hidden menu item
 func (item *MenuItem) Show() {
 	showMenuItem(item)
-}
-
-// Checked returns if the menu item has a check mark
-func (item *MenuItem) Checked() bool {
-	return item.checked
-}
-
-// Check a menu item regardless if it's previously checked or not
-func (item *MenuItem) Check() {
-	item.checked = true
-	item.update()
-}
-
-// Uncheck a menu item regardless if it's previously unchecked or not
-func (item *MenuItem) Uncheck() {
-	item.checked = false
-	item.update()
 }
 
 // update propagates changes on a menu item to systray

@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"lanoclip/internal/store"
 )
 
 var (
@@ -83,11 +85,11 @@ func installCombo(s, fallback string) (int, int, error) {
 // (i.e. from inside the tray's onReady callback): Carbon event targets are
 // main-thread bound.
 func Install(onQRFn, onHistoryFn func(), qrCombo, histCombo string) error {
-	keyQR, modsQR, err := installCombo(qrCombo, "meta+shift+q")
+	keyQR, modsQR, err := installCombo(qrCombo, store.DefaultHotkeyQR())
 	if err != nil {
 		return fmt.Errorf("二维码快捷键无效: %w", err)
 	}
-	keyH, modsH, err := installCombo(histCombo, "meta+shift+v")
+	keyH, modsH, err := installCombo(histCombo, store.DefaultHotkeyHistory())
 	if err != nil {
 		return fmt.Errorf("历史快捷键无效: %w", err)
 	}
@@ -117,11 +119,11 @@ func Update(qrCombo, histCombo string) error {
 	}
 	mu.Unlock()
 
-	keyQR, modsQR, err := installCombo(qrCombo, "meta+shift+q")
+	keyQR, modsQR, err := installCombo(qrCombo, store.DefaultHotkeyQR())
 	if err != nil {
 		return fmt.Errorf("二维码快捷键无效: %w", err)
 	}
-	keyH, modsH, err := installCombo(histCombo, "meta+shift+v")
+	keyH, modsH, err := installCombo(histCombo, store.DefaultHotkeyHistory())
 	if err != nil {
 		return fmt.Errorf("历史快捷键无效: %w", err)
 	}

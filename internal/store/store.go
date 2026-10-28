@@ -99,7 +99,6 @@ type Store struct {
 
 func (s *Store) textsPath() string    { return filepath.Join(s.dir, "texts.json") }
 func (s *Store) imagesPath() string   { return filepath.Join(s.dir, "images.json") }
-func (s *Store) legacyPath() string   { return filepath.Join(s.dir, "history.json") }
 func (s *Store) settingsPath() string { return filepath.Join(s.dir, "settings.json") }
 
 // NewStore loads the records. When dir is empty it falls back to the
@@ -135,27 +134,8 @@ func NewStore(dir string) (*Store, error) {
 
 func (s *Store) load() {
 	s.loadSettings()
-	loadedTexts := s.loadFile(s.textsPath(), &s.texts)
-	loadedImages := s.loadFile(s.imagesPath(), &s.images)
-
-	// One-time migration from the single-file layout (history.json).
-	if !loadedTexts && !loadedImages {
-		var all []Record
-		if s.loadFile(s.legacyPath(), &all) {
-			for _, r := range all {
-				if r.Kind == KindImage {
-					s.images = append(s.images, r)
-				} else {
-					r.Kind = KindText
-					s.texts = append(s.texts, r)
-				}
-			}
-			s.dirty = true
-			saveQuiet(s)
-			// 保留旧文件但改名，避免下次再迁移
-			_ = os.Rename(s.legacyPath(), s.legacyPath()+".migrated")
-		}
-	}
+	s.loadFile(s.textsPath(), &s.texts)
+	s.loadFile(s.imagesPath(), &s.images)
 
 	// 两类各按各的现有 ID 续号（历史数据里文本 / 图片的号段本来就各自独立）
 	for _, list := range [][]Record{s.texts, s.images} {
@@ -185,19 +165,10 @@ func (s *Store) load() {
 // loadFile reads a JSON array into dst; it reports whether the file existed
 // and decoded successfully.
 func (s *Store) loadFile(path string, dst *[]Record) bool {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return false
-	}
-	var records []Record
-	if err := json.Unmarshal(data, &records); err != nil {
-		return false
-	}
-	*dst = records
-	return true
+	return readJSONFile(path, dst)
 }
 
-// readJSONFile decodes a JSON object into dst; it reports success.
+// readJSONFile decodes a JSON array or object into dst; it reports success.
 func readJSONFile(path string, dst any) bool {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -617,11 +588,4 @@ func orEmpty(records []Record) []Record {
 		return []Record{}
 	}
 	return records
-}
-
-// saveQuiet persists during load/migration, where the mutex is not yet held by
-// callers and errors are not actionable.
-func saveQuiet(s *Store) {
-	_ = writeJSONFile(s.textsPath(), orEmpty(s.texts))
-	_ = writeJSONFile(s.imagesPath(), orEmpty(s.images))
 }

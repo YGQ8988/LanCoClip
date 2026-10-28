@@ -36,11 +36,11 @@ func nativeReadText() (string, bool) {
 
 // lancoclipChanges emits one signal each time the lancoclip change counter
 // moves, i.e. once per lancoclip write.
-func lancoclipChanges(ctx context.Context, interval time.Duration) <-chan struct{} {
+func lancoclipChanges(ctx context.Context) <-chan struct{} {
 	ch := make(chan struct{}, 1)
 	go func() {
 		last := C.copyLancoclipChangeCount()
-		t := time.NewTicker(effectivePoll(interval))
+		t := time.NewTicker(changePollInterval)
 		defer t.Stop()
 		for {
 			select {

@@ -132,7 +132,7 @@ build_app() {
   echo ""
   echo ">> 编译 ${goarch}（本机 ${HOST_ARCH} → ${zip_name}）"
   GOOS=darwin GOARCH="${goarch}" CGO_ENABLED=1 \
-    go build -trimpath -ldflags="-s -w -X 'main.version=${VERSION}' -X 'main.buildTime=${BUILD_TIME}'" -o ".build/${APP_NAME}-${goarch}" .
+    go build -trimpath -ldflags="-s -w -X 'lanoclip/internal/server.Version=${VERSION}' -X 'lanoclip/internal/server.BuildTime=${BUILD_TIME}'" -o ".build/${APP_NAME}-${goarch}" .
 
   rm -rf "${app_dir}"
   mkdir -p "${app_dir}/Contents/MacOS" "${app_dir}/Contents/Resources"

@@ -97,12 +97,12 @@ func lancoclipUnicodeText() (string, bool) {
 // primary path; if Windows refuses to hand out a message-only window (or the
 // listener API is unavailable), it degrades to polling the lancoclip sequence
 // number, which is still a single cheap user32 call.
-func lancoclipChanges(ctx context.Context, interval time.Duration) <-chan struct{} {
+func lancoclipChanges(ctx context.Context) <-chan struct{} {
 	ch := make(chan struct{}, 1)
 	go func() {
 		if err := runLancoclipListener(ctx, ch); err != nil {
 			log.Printf("lancoclip change listener unavailable (%v); falling back to sequence polling", err)
-			pollLancoclipSequence(ctx, ch, interval)
+			pollLancoclipSequence(ctx, ch)
 		}
 	}()
 	return ch
@@ -223,9 +223,9 @@ func runLancoclipListener(ctx context.Context, ch chan<- struct{}) error {
 // pollLancoclipSequence is the fallback detector: GetClipboardSequenceNumber
 // increments on every lancoclip write, so one user32 call per tick is enough —
 // no subprocess involved.
-func pollLancoclipSequence(ctx context.Context, ch chan<- struct{}, interval time.Duration) {
+func pollLancoclipSequence(ctx context.Context, ch chan<- struct{}) {
 	last, _, _ := procGetLancoclipSequenceNumber.Call()
-	t := time.NewTicker(effectivePoll(interval))
+	t := time.NewTicker(changePollInterval)
 	defer t.Stop()
 	for {
 		select {

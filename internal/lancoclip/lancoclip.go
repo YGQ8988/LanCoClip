@@ -137,16 +137,6 @@ func normalizeText(s string) string {
 // recorded separately instead of collapsing into the last one.
 const changePollInterval = 40 * time.Millisecond
 
-// effectivePoll caps the change-detection cadence at changePollInterval, while
-// still honouring a smaller -interval (a slower one is not useful: it is what
-// made rapid copies get merged).
-func effectivePoll(interval time.Duration) time.Duration {
-	if interval > 0 && interval < changePollInterval {
-		return interval
-	}
-	return changePollInterval
-}
-
 // signalChange delivers a change notification without blocking. The channel is
 // a "something changed" flag, not a queue: the probe reads the current
 // lancoclip state anyway, so a second pending signal carries no extra
@@ -229,13 +219,13 @@ func (w *lancoclipWatcher) probe() {
 //
 // Change detection is platform-specific (see lancoclip_native_*.go): macOS
 // polls the lancoclip change counter, Windows listens for WM_CLIPBOARDUPDATE,
-// other platforms fall back to interval polling.
-func Watch(ctx context.Context, interval time.Duration, sup *Suppressor,
+// other platforms fall back to fixed-interval polling.
+func Watch(ctx context.Context, sup *Suppressor,
 	onText func(string), onImage func([]byte)) {
 	w := newLancoclipWatcher(sup, onText, onImage)
 	w.seed()
 
-	changes := lancoclipChanges(ctx, interval)
+	changes := lancoclipChanges(ctx)
 	for {
 		select {
 		case <-ctx.Done():

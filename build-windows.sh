@@ -93,7 +93,7 @@ build_exe() {
   mkdir -p "${stage}"
   # 解压后统一是 LanCoClip.exe，架构只体现在 zip 文件名上
   GOOS=windows GOARCH="${goarch}" CGO_ENABLED=0 \
-    go build -trimpath -ldflags="-s -w -H windowsgui -X 'main.version=${VERSION}' -X 'main.buildTime=${BUILD_TIME}'" \
+    go build -trimpath -ldflags="-s -w -H windowsgui -X 'lanoclip/internal/server.Version=${VERSION}' -X 'lanoclip/internal/server.BuildTime=${BUILD_TIME}'" \
     -o "${stage}/${APP_NAME}.exe" .
 
   make_zip "${zip_name}" "${stage}/${APP_NAME}.exe"

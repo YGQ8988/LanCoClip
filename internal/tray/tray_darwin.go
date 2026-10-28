@@ -16,6 +16,7 @@ import (
 	"time"
 	"unsafe"
 
+	"lanoclip/internal/open"
 	"lanoclip/internal/systray"
 )
 
@@ -52,7 +53,7 @@ func Run(app App, opts Options) {
 			}()
 		}
 
-		run(app, confirmClearAll, func(u string) { _ = exec.Command("open", u).Start() }, opts)
+		run(app, confirmClearAll, open.Open, opts)
 	}, func() {})
 }
 

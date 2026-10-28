@@ -31,8 +31,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"image"
-	_ "image/jpeg" // 注册 jpeg 解码器，供 image.Decode 使用
 	"image/color"
+	_ "image/jpeg" // 注册 jpeg 解码器，供 image.Decode 使用
 	"image/png"
 	"os"
 	"path/filepath"

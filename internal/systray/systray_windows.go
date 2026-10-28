@@ -1,3 +1,4 @@
+//go:build windows
 // +build windows
 
 package systray
@@ -117,11 +118,11 @@ type notifyIconData struct {
 	// Modelling them as two fields made this struct 4 bytes larger than
 	// the real one and shifted InfoTitle/InfoFlags/GuidItem/BalloonIcon,
 	// which silently broke balloon notifications (NIF_INFO).
-	Timeout       uint32
-	InfoTitle     [64]uint16
-	InfoFlags     uint32
-	GuidItem      windows.GUID
-	BalloonIcon   windows.Handle
+	Timeout     uint32
+	InfoTitle   [64]uint16
+	InfoFlags   uint32
+	GuidItem    windows.GUID
+	BalloonIcon windows.Handle
 }
 
 func (nid *notifyIconData) add() error {

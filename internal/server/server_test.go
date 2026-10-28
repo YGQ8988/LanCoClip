@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"bytes"
@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"lanoclip/internal/lanaddr"
 	"lanoclip/internal/lancoclip"
 	"lanoclip/internal/notify"
 	"lanoclip/internal/store"
@@ -32,8 +33,44 @@ func newTestStore(t *testing.T) *store.Store {
 	return st
 }
 
+// newTestServer builds a Server with a throwaway store, ready for handler tests.
+func newTestServer(t *testing.T) *Server {
+	t.Helper()
+	return &Server{
+		store:      newTestStore(t),
+		suppressor: lancoclip.NewSuppressor(),
+		localIPs:   map[string]bool{},
+		shareURL:   "http://192.168.1.10:6116",
+	}
+}
+
+// serve runs a request through the real router (routes + handlers) and returns
+// the recorder. It centralises the boilerplate every handler test used to repeat
+// inline: building the request, setting RemoteAddr / User-Agent, and dispatching.
+func serve(s *Server, method, target, remote, ua, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, target, strings.NewReader(body))
+	req.RemoteAddr = remote
+	if ua != "" {
+		req.Header.Set("User-Agent", ua)
+	}
+	rec := httptest.NewRecorder()
+	s.Routes().ServeHTTP(rec, req)
+	return rec
+}
+
+// decodeJSON unmarshals a recorder body into a map[string]any, failing the test
+// on malformed JSON.
+func decodeJSON(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	var out map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("bad json (%s): %v", rec.Body.String(), err)
+	}
+	return out
+}
+
 func TestCanClear(t *testing.T) {
-	s := &server{localIPs: map[string]bool{"192.168.1.10": true}}
+	s := &Server{localIPs: map[string]bool{"192.168.1.10": true}}
 
 	cases := []struct {
 		name   string
@@ -82,7 +119,7 @@ func TestIsMobileUA(t *testing.T) {
 }
 
 func TestHandleRecordsPagination(t *testing.T) {
-	s := &server{
+	s := &Server{
 		store:    newTestStore(t),
 		localIPs: map[string]bool{},
 		shareURL: "http://192.168.1.10:8899",
@@ -95,15 +132,7 @@ func TestHandleRecordsPagination(t *testing.T) {
 	}
 
 	get := func(query string) map[string]any {
-		req := httptest.NewRequest(http.MethodGet, "/api/records?"+query, nil)
-		req.RemoteAddr = "192.168.1.99:5000"
-		rec := httptest.NewRecorder()
-		s.handleRecords(rec, req)
-		var out map[string]any
-		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
-			t.Fatalf("bad json: %v", err)
-		}
-		return out
+		return decodeJSON(t, serve(s, http.MethodGet, "/api/records?"+query, "192.168.1.99:5000", "", ""))
 	}
 
 	// 默认文本、每页 10 条
@@ -149,27 +178,14 @@ func TestHandleRecordsPagination(t *testing.T) {
 }
 
 func TestHandleSuppress(t *testing.T) {
-	newServer := func() *server {
-		return &server{
-			store:      newTestStore(t),
-			suppressor: lancoclip.NewSuppressor(),
-			localIPs:   map[string]bool{},
-			shareURL:   "http://192.168.1.10:6116",
-		}
-	}
 	desktopUA := "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15"
 
-	post := func(s *server, remote, ua, body string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodPost, "/api/suppress", strings.NewReader(body))
-		req.RemoteAddr = remote
-		req.Header.Set("User-Agent", ua)
-		rec := httptest.NewRecorder()
-		s.handleSuppress(rec, req)
-		return rec
+	post := func(sv *Server, remote, ua, body string) *httptest.ResponseRecorder {
+		return serve(sv, http.MethodPost, "/api/suppress", remote, ua, body)
 	}
 
 	// 本机：登记抑制；唯一的那条记录必须保留（否则就是删了原始记录）
-	s := newServer()
+	s := newTestServer(t)
 	s.store.AddText("from-page")
 	rec := post(s, "127.0.0.1:5000", desktopUA, `{"kind":"text","content":"from-page"}`)
 	if rec.Code != http.StatusOK {
@@ -183,7 +199,7 @@ func TestHandleSuppress(t *testing.T) {
 	}
 
 	// 本机：真·重复（存在更早的同内容记录）才撤回最新那条
-	sdup := newServer()
+	sdup := newTestServer(t)
 	sdup.store.AddText("dup")
 	sdup.store.AddText("other")
 	sdup.store.AddText("dup") // [dup, other, dup]
@@ -193,14 +209,14 @@ func TestHandleSuppress(t *testing.T) {
 	}
 
 	// 手机：不允许（手机上复制不经过本机剪贴板）
-	s2 := newServer()
+	s2 := newTestServer(t)
 	rec2 := post(s2, "127.0.0.1:5000", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile/15E148", `{"kind":"text","content":"x"}`)
 	if rec2.Code != http.StatusForbidden {
 		t.Fatalf("mobile suppress = %d, want 403", rec2.Code)
 	}
 
 	// 未知图片 / 空内容
-	s3 := newServer()
+	s3 := newTestServer(t)
 	if rec := post(s3, "127.0.0.1:5000", desktopUA, `{"kind":"image","id":999}`); rec.Code != http.StatusNotFound {
 		t.Fatalf("unknown image = %d, want 404", rec.Code)
 	}
@@ -208,10 +224,7 @@ func TestHandleSuppress(t *testing.T) {
 		t.Fatalf("empty content = %d, want 400", rec.Code)
 	}
 	// 非 POST
-	req := httptest.NewRequest(http.MethodGet, "/api/suppress", nil)
-	req.RemoteAddr = "127.0.0.1:5000"
-	recGET := httptest.NewRecorder()
-	s3.handleSuppress(recGET, req)
+	recGET := serve(s3, http.MethodGet, "/api/suppress", "127.0.0.1:5000", "", "")
 	if recGET.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("GET = %d, want 405", recGET.Code)
 	}
@@ -238,19 +251,19 @@ func TestVirtualInterfaceDetection(t *testing.T) {
 	virtual := []string{"utun3", "bridge0", "vmnet1", "docker0", "awdl0", "llw0", "anpi0", "ap1", "lo0", "gpd0"}
 	physical := []string{"en0", "en1", "eth0", "wlan0"}
 	for _, n := range virtual {
-		if !isVirtualInterface(n) {
+		if !lanaddr.IsVirtualInterface(n) {
 			t.Errorf("%s should be virtual", n)
 		}
 	}
 	for _, n := range physical {
-		if isVirtualInterface(n) {
+		if lanaddr.IsVirtualInterface(n) {
 			t.Errorf("%s should not be virtual", n)
 		}
 	}
 }
 
 func TestBestLocalIPPrefersPhysical(t *testing.T) {
-	ip := bestLocalIP()
+	ip := lanaddr.BestLocalIP()
 	if ip == "" || net.ParseIP(ip) == nil {
 		t.Fatalf("bestLocalIP returned %q", ip)
 	}
@@ -260,10 +273,10 @@ func TestBestLocalIPPrefersPhysical(t *testing.T) {
 		return
 	}
 	for _, ifi := range ifs {
-		if isVirtualInterface(ifi.Name) {
+		if lanaddr.IsVirtualInterface(ifi.Name) {
 			continue
 		}
-		if v := firstIPv4(ifi); v != "" && ip == v {
+		if v := lanaddr.FirstIPv4(ifi); v != "" && ip == v {
 			return // matched a physical interface, ok
 		}
 	}
@@ -271,16 +284,12 @@ func TestBestLocalIPPrefersPhysical(t *testing.T) {
 }
 
 func TestHandleRecordsShape(t *testing.T) {
-	s := &server{
+	s := &Server{
 		store:    newTestStore(t),
 		localIPs: map[string]bool{},
 		shareURL: "http://192.168.1.10:8899",
 	}
-	req := httptest.NewRequest(http.MethodGet, "/api/records", nil)
-	req.RemoteAddr = "192.168.1.99:5000"
-	rec := httptest.NewRecorder()
-
-	s.handleRecords(rec, req)
+	rec := serve(s, http.MethodGet, "/api/records", "192.168.1.99:5000", "", "")
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
@@ -292,40 +301,18 @@ func TestHandleRecordsShape(t *testing.T) {
 
 // /api/settings：GET 任何人可看；POST 仅服务本机，保存立即生效。
 func TestHandleSettings(t *testing.T) {
-	newServer := func() *server {
-		return &server{
-			store:      newTestStore(t),
-			suppressor: lancoclip.NewSuppressor(),
-			localIPs:   map[string]bool{},
-			shareURL:   "http://192.168.1.10:6116",
-		}
-	}
 	desktopUA := "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15"
 	mobileUA := "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile/15E148"
 
-	get := func(s *server) map[string]any {
-		req := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
-		req.RemoteAddr = "192.168.1.99:5000"
-		rec := httptest.NewRecorder()
-		s.handleSettings(rec, req)
-		var out map[string]any
-		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
-			t.Fatalf("bad json: %v", err)
-		}
-		return out
+	get := func(sv *Server) map[string]any {
+		return decodeJSON(t, serve(sv, http.MethodGet, "/api/settings", "192.168.1.99:5000", "", ""))
 	}
-
-	post := func(s *server, remote, ua, body string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodPost, "/api/settings", strings.NewReader(body))
-		req.RemoteAddr = remote
-		req.Header.Set("User-Agent", ua)
-		rec := httptest.NewRecorder()
-		s.handleSettings(rec, req)
-		return rec
+	post := func(sv *Server, remote, ua, body string) *httptest.ResponseRecorder {
+		return serve(sv, http.MethodPost, "/api/settings", remote, ua, body)
 	}
 
 	// GET：返回当前配置（默认值）
-	s := newServer()
+	s := newTestServer(t)
 	cur := get(s)
 	if cur["maxText"] != float64(store.DefaultMaxTextRecords) || cur["maxImage"] != float64(store.DefaultMaxImageRecords) {
 		t.Fatalf("GET settings wrong: %v", cur)
@@ -339,10 +326,7 @@ func TestHandleSettings(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("local POST = %d, want 200", rec.Code)
 	}
-	var out map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
-		t.Fatalf("bad json: %v", err)
-	}
+	out := decodeJSON(t, rec)
 	if out["trimmedText"] != float64(2) {
 		t.Fatalf("trimmedText = %v, want 2", out["trimmedText"])
 	}
@@ -351,7 +335,7 @@ func TestHandleSettings(t *testing.T) {
 	}
 
 	// POST：手机 / 其他设备不允许
-	s2 := newServer()
+	s2 := newTestServer(t)
 	if rec := post(s2, "127.0.0.1:5000", mobileUA, `{"maxText":10,"maxImage":10}`); rec.Code != http.StatusForbidden {
 		t.Fatalf("mobile POST = %d, want 403", rec.Code)
 	}
@@ -360,7 +344,7 @@ func TestHandleSettings(t *testing.T) {
 	}
 
 	// POST：坏请求
-	s3 := newServer()
+	s3 := newTestServer(t)
 	if rec := post(s3, "127.0.0.1:5000", desktopUA, `not-json`); rec.Code != http.StatusBadRequest {
 		t.Fatalf("bad json POST = %d, want 400", rec.Code)
 	}
@@ -369,10 +353,7 @@ func TestHandleSettings(t *testing.T) {
 	}
 
 	// 其他方法
-	req := httptest.NewRequest(http.MethodPut, "/api/settings", nil)
-	req.RemoteAddr = "127.0.0.1:5000"
-	recPUT := httptest.NewRecorder()
-	s3.handleSettings(recPUT, req)
+	recPUT := serve(s3, http.MethodPut, "/api/settings", "127.0.0.1:5000", "", "")
 	if recPUT.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("PUT = %d, want 405", recPUT.Code)
 	}
@@ -382,7 +363,7 @@ func TestHandleSettings(t *testing.T) {
 func TestTrayItemLabel(t *testing.T) {
 	now := time.Now()
 	long := strings.Repeat("字", 40)
-	got := trayItemLabel(store.Record{Kind: store.KindText, Content: long, CreatedAt: now.UnixMilli()})
+	got := TrayItemLabel(store.Record{Kind: store.KindText, Content: long, CreatedAt: now.UnixMilli()})
 	// 截断到 36 字 + 省略号 + 时间戳前缀 "HH:MM  "
 	if !strings.HasSuffix(got, "…") || !strings.Contains(got, strings.Repeat("字", 36)) {
 		t.Fatalf("label not truncated: %q", got)
@@ -394,26 +375,26 @@ func TestTrayItemLabel(t *testing.T) {
 		t.Fatalf("label missing HH:MM stamp: %q", got)
 	}
 
-	got = trayItemLabel(store.Record{Kind: store.KindText, Content: "a\nb", CreatedAt: now.UnixMilli()})
+	got = TrayItemLabel(store.Record{Kind: store.KindText, Content: "a\nb", CreatedAt: now.UnixMilli()})
 	if !strings.Contains(got, "a b") {
 		t.Fatalf("newline not flattened: %q", got)
 	}
 
-	got = trayItemLabel(store.Record{Kind: store.KindImage, CreatedAt: now.UnixMilli()})
+	got = TrayItemLabel(store.Record{Kind: store.KindImage, CreatedAt: now.UnixMilli()})
 	if !strings.Contains(got, "[图片]") {
 		t.Fatalf("image placeholder missing: %q", got)
 	}
 
 	// 跨天记录带日期前缀
 	old := now.AddDate(0, 0, -3)
-	got = trayItemLabel(store.Record{Kind: store.KindText, Content: "hi", CreatedAt: old.UnixMilli()})
+	got = TrayItemLabel(store.Record{Kind: store.KindText, Content: "hi", CreatedAt: old.UnixMilli()})
 	wantDate := old.Format("01-02")
 	if !strings.HasPrefix(got, wantDate) {
 		t.Fatalf("old record should start with %q, got %q", wantDate, got)
 	}
 
 	// 空文本兜底
-	got = trayItemLabel(store.Record{Kind: store.KindText, Content: "  \n ", CreatedAt: now.UnixMilli()})
+	got = TrayItemLabel(store.Record{Kind: store.KindText, Content: "  \n ", CreatedAt: now.UnixMilli()})
 	if !strings.Contains(got, "（空白文本）") {
 		t.Fatalf("blank text fallback missing: %q", got)
 	}
@@ -421,7 +402,7 @@ func TestTrayItemLabel(t *testing.T) {
 
 // server.ClearAll（tray.App）: 文本与图片一起清空，图片文件同步删除。
 func TestServerClearAllViaTray(t *testing.T) {
-	s := &server{store: newTestStore(t), localIPs: map[string]bool{}}
+	s := &Server{store: newTestStore(t), localIPs: map[string]bool{}}
 	s.store.AddText("keep-me-no-more")
 	if added, err := s.store.AddImage([]byte{9, 'P', 'N', 'G'}); err != nil || !added {
 		t.Fatalf("AddImage: added=%v err=%v", added, err)
@@ -450,7 +431,7 @@ func TestServerClearAllViaTray(t *testing.T) {
 
 // /api/recent：文本+图片混合、最新在前，limit 夹取生效，meta 字段齐全。
 func TestHandleRecent(t *testing.T) {
-	s := &server{store: newTestStore(t), localIPs: map[string]bool{}, shareURL: "http://192.168.1.10:8899"}
+	s := &Server{store: newTestStore(t), localIPs: map[string]bool{}, shareURL: "http://192.168.1.10:8899"}
 	for i := 1; i <= 5; i++ {
 		s.store.AddText(fmt.Sprintf("text-%d", i))
 		time.Sleep(2 * time.Millisecond) // 保证 CreatedAt 可区分顺序
@@ -460,15 +441,7 @@ func TestHandleRecent(t *testing.T) {
 	s.store.AddText("newest")
 
 	get := func(query string) map[string]any {
-		req := httptest.NewRequest(http.MethodGet, "/api/recent"+query, nil)
-		req.RemoteAddr = "127.0.0.1:5000"
-		rec := httptest.NewRecorder()
-		s.handleRecent(rec, req)
-		var out map[string]any
-		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
-			t.Fatalf("bad json: %v", err)
-		}
-		return out
+		return decodeJSON(t, serve(s, http.MethodGet, "/api/recent"+query, "127.0.0.1:5000", "", ""))
 	}
 
 	out := get("?limit=30")
@@ -506,15 +479,9 @@ func TestHandleRecent(t *testing.T) {
 // /api/settings 的 autostart 扩展：GET 带字段，POST 可只提交 autostart。
 // 注意：不能在测试里真的启用自启（mac 会写 LaunchAgent），只测关闭方向。
 func TestHandleSettingsAutostart(t *testing.T) {
-	s := &server{store: newTestStore(t), localIPs: map[string]bool{}, shareURL: "http://x:1"}
+	s := &Server{store: newTestStore(t), localIPs: map[string]bool{}, shareURL: "http://x:1"}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
-	rec := httptest.NewRecorder()
-	s.handleSettings(rec, req)
-	var cur map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &cur); err != nil {
-		t.Fatalf("bad json: %v", err)
-	}
+	cur := decodeJSON(t, serve(s, http.MethodGet, "/api/settings", "", "", ""))
 	if _, ok := cur["autostart"]; !ok {
 		t.Fatalf("GET settings missing autostart: %v", cur)
 	}
@@ -523,27 +490,17 @@ func TestHandleSettingsAutostart(t *testing.T) {
 	}
 
 	// 只提交 autostart=false 也应成功（旧逻辑强制要求 maxText/maxImage）
-	body := `{"autostart": false}`
-	req = httptest.NewRequest(http.MethodPost, "/api/settings", strings.NewReader(body))
-	req.RemoteAddr = "127.0.0.1:5000"
-	rec = httptest.NewRecorder()
-	s.handleSettings(rec, req)
+	rec := serve(s, http.MethodPost, "/api/settings", "127.0.0.1:5000", "", `{"autostart": false}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST autostart=false: code=%d body=%s", rec.Code, rec.Body.String())
 	}
-	var out map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
-		t.Fatalf("bad json: %v", err)
-	}
+	out := decodeJSON(t, rec)
 	if out["autostart"] != false {
 		t.Fatalf("autostart should stay false: %v", out)
 	}
 
 	// 手机端（无权限）POST 被拒
-	req = httptest.NewRequest(http.MethodPost, "/api/settings", strings.NewReader(body))
-	req.Header.Set("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)")
-	rec = httptest.NewRecorder()
-	s.handleSettings(rec, req)
+	rec = serve(s, http.MethodPost, "/api/settings", "127.0.0.1:5000", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)", `{"autostart": false}`)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("mobile POST should be 403, got %d", rec.Code)
 	}
@@ -552,14 +509,10 @@ func TestHandleSettingsAutostart(t *testing.T) {
 // /api/settings 的快捷键扩展：GET 回显当前组合，POST 校验（非法 400、相同 400），
 // 合法提交后 GET 返回新值。测试环境托盘未运行，hotkey.Update 是 no-op。
 func TestHandleSettingsHotkeys(t *testing.T) {
-	s := &server{store: newTestStore(t), localIPs: map[string]bool{}, shareURL: "http://x:1"}
+	s := &Server{store: newTestStore(t), localIPs: map[string]bool{}, shareURL: "http://x:1"}
 
 	post := func(body string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodPost, "/api/settings", strings.NewReader(body))
-		req.RemoteAddr = "127.0.0.1:5000"
-		rec := httptest.NewRecorder()
-		s.handleSettings(rec, req)
-		return rec
+		return serve(s, http.MethodPost, "/api/settings", "127.0.0.1:5000", "", body)
 	}
 
 	// 非法组合 → 400
@@ -575,13 +528,7 @@ func TestHandleSettingsHotkeys(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("valid combo should 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	req := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
-	grec := httptest.NewRecorder()
-	s.handleSettings(grec, req)
-	var out map[string]any
-	if err := json.Unmarshal(grec.Body.Bytes(), &out); err != nil {
-		t.Fatalf("bad json: %v", err)
-	}
+	out := decodeJSON(t, serve(s, http.MethodGet, "/api/settings", "", "", ""))
 	if out["hotkeyQR"] != "meta+alt+q" {
 		t.Fatalf("hotkeyQR should persist, got %v", out["hotkeyQR"])
 	}
@@ -589,10 +536,7 @@ func TestHandleSettingsHotkeys(t *testing.T) {
 	if rec := post(`{"hotkeyQR":"","hotkeyHistory":""}`); rec.Code != http.StatusOK {
 		t.Fatalf("empty reset should 200, got %d", rec.Code)
 	}
-	req = httptest.NewRequest(http.MethodGet, "/api/settings", nil)
-	grec = httptest.NewRecorder()
-	s.handleSettings(grec, req)
-	_ = json.Unmarshal(grec.Body.Bytes(), &out)
+	out = decodeJSON(t, serve(s, http.MethodGet, "/api/settings", "", "", ""))
 	if out["hotkeyQR"] == "" {
 		t.Fatalf("empty combo should fall back to default, got %v", out["hotkeyQR"])
 	}
@@ -602,7 +546,7 @@ func TestHandleSettingsHotkeys(t *testing.T) {
 // canClear 的本机地址集都必须跟着刷新，而不是沿用启动时缓存的旧值。
 func TestRefreshNetAfterNetworkSwitch(t *testing.T) {
 	// port != 0 表示「生产模式」：缓存过期后 refreshNet 必须重新探测
-	s := &server{
+	s := &Server{
 		port:     6116,
 		localIPs: map[string]bool{"203.0.113.99": true}, // 假设的旧 IP
 	}
@@ -610,7 +554,7 @@ func TestRefreshNetAfterNetworkSwitch(t *testing.T) {
 	s.netChecked = time.Now().Add(-time.Minute) // 缓存已过期
 
 	// URL 必须重算成当前机器的真实地址，而不是旧缓存
-	want := fmt.Sprintf("http://%s:6116", bestLocalIP())
+	want := fmt.Sprintf("http://%s:6116", lanaddr.BestLocalIP())
 	if got := s.URL(); got != want {
 		t.Fatalf("URL() = %q, want %q (stale cache must be refreshed)", got, want)
 	}
@@ -629,18 +573,14 @@ func TestRefreshNetAfterNetworkSwitch(t *testing.T) {
 
 // 重复启动：已在运行的实例收到 /api/activate 后自报家门并弹通知。
 func TestHandleActivate(t *testing.T) {
-	orig := openBrowser
+	orig := Open
 	var opened []string
-	openBrowser = func(u string) { opened = append(opened, u) }
-	defer func() { openBrowser = orig }()
+	Open = func(u string) { opened = append(opened, u) }
+	defer func() { Open = orig }()
 
-	s := &server{port: 6116, store: newTestStore(t), localIPs: map[string]bool{}, shareURL: "http://192.168.1.10:6116"}
+	s := &Server{port: 6116, store: newTestStore(t), localIPs: map[string]bool{}, shareURL: "http://192.168.1.10:6116"}
 	post := func(remote string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodPost, "/api/activate", strings.NewReader("{}"))
-		req.RemoteAddr = remote
-		rec := httptest.NewRecorder()
-		s.handleActivate(rec, req)
-		return rec
+		return serve(s, http.MethodPost, "/api/activate", remote, "", "{}")
 	}
 
 	rec := post("127.0.0.1:54321")
@@ -676,10 +616,7 @@ func TestHandleActivate(t *testing.T) {
 	}
 
 	// 探测只走 POST
-	req := httptest.NewRequest(http.MethodGet, "/api/activate", nil)
-	req.RemoteAddr = "127.0.0.1:1"
-	recGET := httptest.NewRecorder()
-	s.handleActivate(recGET, req)
+	recGET := serve(s, http.MethodGet, "/api/activate", "127.0.0.1:1", "", "")
 	if recGET.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("GET activate = %d, want 405", recGET.Code)
 	}
@@ -737,11 +674,11 @@ func portOf(t *testing.T, rawURL string) int {
 
 // canClear 在切网后同样要认得「新的本机 IP」：请求来自当前真实网卡地址时放行。
 func TestCanClearAfterNetworkSwitch(t *testing.T) {
-	cur := bestLocalIP()
+	cur := lanaddr.BestLocalIP()
 	if cur == "127.0.0.1" {
 		t.Skip("no LAN IP on this machine")
 	}
-	s := &server{port: 6116, localIPs: map[string]bool{"203.0.113.99": true}}
+	s := &Server{port: 6116, localIPs: map[string]bool{"203.0.113.99": true}}
 	s.shareURL = "http://203.0.113.99:6116"
 	s.netChecked = time.Now().Add(-time.Minute)
 
@@ -758,7 +695,7 @@ func TestCanClearAfterNetworkSwitch(t *testing.T) {
 // 这两个接口故意对局域网开放（不像 /api/clear 只认本机）——手机能往电脑上
 // 写记录正是它的用途，且全程不碰系统剪贴板，不会让本机 watcher 重复记录。
 func TestHandleAddFromPhone(t *testing.T) {
-	s := &server{
+	s := &Server{
 		store:      newTestStore(t),
 		suppressor: lancoclip.NewSuppressor(),
 		localIPs:   map[string]bool{},
@@ -767,19 +704,10 @@ func TestHandleAddFromPhone(t *testing.T) {
 	phoneUA := "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile/15E148"
 
 	postText := func(body string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodPost, "/api/add-text", strings.NewReader(body))
-		req.RemoteAddr = "192.168.1.99:5000" // 手机：非本机地址
-		req.Header.Set("User-Agent", phoneUA)
-		rec := httptest.NewRecorder()
-		s.handleAddText(rec, req)
-		return rec
+		return serve(s, http.MethodPost, "/api/add-text", "192.168.1.99:5000", phoneUA, body)
 	}
 	decode := func(rec *httptest.ResponseRecorder) map[string]any {
-		var out map[string]any
-		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
-			t.Fatalf("bad json (%s): %v", rec.Body.String(), err)
-		}
-		return out
+		return decodeJSON(t, rec)
 	}
 
 	// 手机也能写：200 且确实入库
@@ -797,9 +725,7 @@ func TestHandleAddFromPhone(t *testing.T) {
 	if postText(`{"content":"   "}`).Code != http.StatusBadRequest {
 		t.Fatal("blank content should be 400")
 	}
-	getReq := httptest.NewRequest(http.MethodGet, "/api/add-text", nil)
-	getRec := httptest.NewRecorder()
-	s.handleAddText(getRec, getReq)
+	getRec := serve(s, http.MethodGet, "/api/add-text", "", "", "")
 	if getRec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("GET /api/add-text = %d, want 405", getRec.Code)
 	}
