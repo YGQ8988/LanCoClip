@@ -22,6 +22,13 @@ const (
 	msgShow = wmApp + 1
 	msgHide = wmApp + 2
 	wmPaint = 0x000F
+	// wmSetCursor asks who owns the pointer; wmNcHitTest decides whether the
+	// pointer is ours at all. The popover must answer "not mine" to both,
+	// otherwise it swallows the menu's hover and the system ends up with no
+	// cursor to show (which is what turns the pointer into a busy circle).
+	wmSetCursor = 0x0020
+	wmNcHitTest = 0x0084
+	idcArrow    = 32512
 
 	wsPopup         = 0x80000000
 	wsExTopmost     = 0x00000008
@@ -64,6 +71,8 @@ var (
 	pSetWindowPos     = u32.NewProc("SetWindowPos")
 	pShowWindow       = u32.NewProc("ShowWindow")
 	pValidateRect     = u32.NewProc("ValidateRect")
+	pLoadCursor       = u32.NewProc("LoadCursorW")
+	pSetCursor        = u32.NewProc("SetCursor")
 )
 
 type wndClassEx struct {
@@ -195,6 +204,11 @@ func uiLoop() {
 		Background: windows.Handle(6), // COLOR_WINDOW + 1
 		ClassName:  cls,
 	}
+	// An explicit arrow keeps the pointer normal even in the (unexpected) case
+	// where the overlay does receive cursor messages.
+	if cur, _, _ := pLoadCursor.Call(0, uintptr(idcArrow)); cur != 0 {
+		wcex.Cursor = windows.Handle(cur)
+	}
 	wcex.Size = uint32(unsafe.Sizeof(wcex))
 	res, _, _ := pRegisterClass.Call(uintptr(unsafe.Pointer(&wcex)))
 	if res == 0 {
@@ -240,6 +254,19 @@ func wndProc(hwnd windows.Handle, message uint32, wParam, lParam uintptr) uintpt
 	case wmPaint:
 		draw(hwnd)
 		return 0
+	case wmNcHitTest:
+		// HTTRANSPARENT: the overlay is decoration, so the pointer must fall
+		// through to the menu underneath. Without this the popover is
+		// hit-testable (WS_EX_TRANSPARENT alone does NOT make a window
+		// click-through), it steals the highlight from the menu item that
+		// opened it, and Windows — finding a topmost window that hands out no
+		// cursor — paints the busy/working-in-background circle instead.
+		return ^uintptr(0)
+	case wmSetCursor:
+		if cur, _, _ := pLoadCursor.Call(0, uintptr(idcArrow)); cur != 0 {
+			pSetCursor.Call(cur)
+		}
+		return 1
 	}
 	ret, _, _ := pDefWindowProc.Call(uintptr(hwnd), uintptr(message), uintptr(wParam), uintptr(lParam))
 	return ret
