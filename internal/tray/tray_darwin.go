@@ -37,7 +37,7 @@ func Run(app App, opts Options) {
 		// 挖空，只取 alpha 即为合法模板图。
 		systray.SetTemplateIcon(menuIconPNG, menuIconPNG)
 		systray.SetTitle("")
-		systray.SetTooltip("剪贴板")
+		systray.SetTooltip(appTooltip)
 
 		// Fallback: set NSStatusItem.button.image through Cocoa directly.
 		// systray's own icon path can silently fail on macOS 26 (Tahoe); re-setting

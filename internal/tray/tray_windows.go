@@ -22,7 +22,7 @@ func Supported() bool { return true }
 func Run(app App, opts Options) {
 	systray.Run(func() {
 		systray.SetIcon(menuIconICO) // Windows 需要 .ico
-		systray.SetTooltip("剪贴板")
+		systray.SetTooltip(appTooltip)
 		run(app, confirmClearAll, open.Open, opts)
 	}, func() {})
 }

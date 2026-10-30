@@ -21,6 +21,10 @@ import (
 // "ready" notification.
 const startupNotifyDelay = 1200 * time.Millisecond
 
+// appTooltip is the text shown when the mouse hovers the tray / menu-bar icon.
+// Shared so macOS and Windows cannot drift apart.
+const appTooltip = "LanCoClip"
+
 // Shared menu wiring for every platform with a native tray (macOS / Windows).
 // Platform files supply the icon, the "open URL" helper and the clear-history
 // confirmation dialog, then hand control to run below.
