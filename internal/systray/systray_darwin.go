@@ -20,6 +20,21 @@ func systrayAnomaly(msg *C.char) {
 	reportAnomaly(C.GoString(msg))
 }
 
+// systray_menu_item_hovered is called from systray_darwin.m whenever the
+// highlighted menu item changes (menuId 0 = nothing highlighted).
+//
+//export systray_menu_item_hovered
+func systray_menu_item_hovered(menuId C.int) {
+	systrayMenuItemHovered(uint32(menuId))
+}
+
+// systray_menu_closed is called from systray_darwin.m when the menu closes.
+//
+//export systray_menu_closed
+func systray_menu_closed() {
+	systrayMenuClosed()
+}
+
 // SetTemplateIcon sets the systray icon as a template icon (on Mac), falling back
 // to a regular icon on other platforms.
 // templateIconBytes and regularIconBytes should be the content of .ico for windows and

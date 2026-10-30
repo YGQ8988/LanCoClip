@@ -14,6 +14,7 @@ import (
 	"lanoclip/internal/hotkey"
 	"lanoclip/internal/notify"
 	"lanoclip/internal/paste"
+	"lanoclip/internal/qrpop"
 )
 
 // startupNotifyDelay is how long to wait after the tray is up before showing the
@@ -45,7 +46,13 @@ type historyRowState struct {
 // called from inside systray.Run's onReady callback.
 func run(app App, confirmClear func() bool, openURL func(string), opts Options) {
 	mOpen := systray.AddMenuItem("打开页面", "在默认浏览器中打开剪贴板历史页面")
-	mSettings := systray.AddMenuItem("设置", "打开页面并弹出设置（文本/图片保留条数）")
+	// 访问二维码：鼠标移到这里就把手机扫码地址以浮窗形式贴在光标旁；
+	// 点击则走浏览器里的大图（与 ⌘⇧Q / Ctrl+Shift+Q 一致）。
+	//
+	// tooltip 刻意留空：macOS 会在 hover 约 1 秒后弹出菜单项自身的系统
+	// tooltip，正好盖在二维码浮窗上，而用途已经由浮窗表达了。
+	mQR := systray.AddMenuItem("访问二维码", "")
+	mSettings := systray.AddMenuItem("设置", "打开页面并弹出设置（文本/图片保留条数/）")
 
 	// 历史：30 条，每 10 条一组（组名直接标号 1-10 / 11-20 / 21-30），
 	// 点击条目复制回剪贴板并模拟粘贴。
@@ -61,7 +68,7 @@ func run(app App, confirmClear func() bool, openURL func(string), opts Options) 
 
 	mClear := systray.AddMenuItem("清除历史", "清除全部文本和图片记录（需二次确认）")
 	systray.AddSeparator()
-	mQuit := systray.AddMenuItem("退出", "退出程序")
+	mQuit := systray.AddMenuItem("退出", "退出LanCoClip")
 
 	historyMu.Lock()
 	historyMIs = entries
@@ -120,6 +127,17 @@ func run(app App, confirmClear func() bool, openURL func(string), opts Options) 
 			select {
 			case <-mOpen.ClickedCh:
 				openURL(app.LocalURL())
+			case hovered := <-mQR.HoveredCh:
+				if hovered {
+					showQRPopover(app)
+				} else {
+					// 移开（或菜单关了）就收起：浮窗是被动的，不能赖在屏幕上
+					qrpop.Hide()
+				}
+			case <-mQR.ClickedCh:
+				// 点击时菜单会关掉，浮窗随之消失，所以点击走的是浏览器大图——
+				// 同时也兜住了「浮窗在当前系统不可用」的情况。
+				openURL(withParam(app.LocalURL(), "qr=1"))
 			case <-mSettings.ClickedCh:
 				u := app.LocalURL()
 				if u != "" && !strings.Contains(u, "?") {
@@ -140,6 +158,21 @@ func run(app App, confirmClear func() bool, openURL func(string), opts Options) 
 		}
 	}()
 }
+
+// showQRPopover pops the phone-scannable address as a QR code beside the
+// pointer. Hovering is the whole point of the entry, so nothing happens on
+// failure: we must not open a browser just because the user moved the mouse.
+func showQRPopover(app App) {
+	if !qrpop.Supported() {
+		return
+	}
+	if err := qrpop.Show(app.URL()); err != nil {
+		// 地址还没定（端口未定/无网卡）时每次 hover 都会失败，只记一次。
+		qrErrOnce.Do(func() { logf("tray qr popover: %v", err) })
+	}
+}
+
+var qrErrOnce sync.Once
 
 // withParam appends "p" to the page URL as a query parameter (?settings=1 风格).
 func withParam(u, p string) string {

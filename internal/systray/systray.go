@@ -58,6 +58,12 @@ type MenuItem struct {
 	// ClickedCh is the channel which will be notified when the menu item is clicked
 	ClickedCh chan struct{}
 
+	// HoveredCh receives true when the pointer highlights this item (the menu
+	// is open and the cursor sits on it) and false when the highlight moves
+	// away or the menu closes. Never blocks: the event is dropped when nobody
+	// is receiving.
+	HoveredCh chan bool
+
 	// id uniquely identify a menu item, not supposed to be modified
 	id uint32
 	// title is the text shown on menu item
@@ -78,6 +84,7 @@ type MenuItem struct {
 func newMenuItem(title string, tooltip string, parent *MenuItem) *MenuItem {
 	return &MenuItem{
 		ClickedCh:   make(chan struct{}),
+		HoveredCh:   make(chan bool, 1),
 		id:          atomic.AddUint32(&currentID, 1),
 		title:       title,
 		tooltip:     tooltip,
@@ -202,6 +209,60 @@ func systrayMenuItemSelected(id uint32) {
 	select {
 	case item.ClickedCh <- struct{}{}:
 	// in case no one waiting for the channel
+	default:
+	}
+}
+
+// hoveredID is the id of the menu item the pointer currently highlights (0 for
+// none). The native layers report every highlight change, and this is what
+// turns them into enter/leave pairs for the item that lost the highlight.
+var (
+	hoveredMu sync.Mutex
+	hoveredID uint32
+)
+
+// systrayMenuItemHovered reports that id became the highlighted item (0 means
+// the highlight moved onto something that is not a real item — a separator, a
+// submenu header — or onto nothing). The item that was highlighted before is
+// told it is no longer hovered, so its listeners can hide what they showed.
+func systrayMenuItemHovered(id uint32) {
+	hoveredMu.Lock()
+	prev := hoveredID
+	hoveredID = id
+	hoveredMu.Unlock()
+	if prev == id {
+		return
+	}
+	if prev != 0 {
+		fireMenuItemHovered(prev, false)
+	}
+	if id != 0 {
+		fireMenuItemHovered(id, true)
+	}
+}
+
+// systrayMenuClosed reports that the menu was dismissed; anything still
+// highlighted is no longer visible.
+func systrayMenuClosed() {
+	hoveredMu.Lock()
+	prev := hoveredID
+	hoveredID = 0
+	hoveredMu.Unlock()
+	if prev != 0 {
+		fireMenuItemHovered(prev, false)
+	}
+}
+
+func fireMenuItemHovered(id uint32, hovered bool) {
+	menuItemsLock.RLock()
+	item, ok := menuItems[id]
+	menuItemsLock.RUnlock()
+	if !ok {
+		return
+	}
+	select {
+	case item.HoveredCh <- hovered:
+	// in case no one is waiting for the channel
 	default:
 	}
 }

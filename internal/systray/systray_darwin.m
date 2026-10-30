@@ -50,9 +50,11 @@ withParentMenuId: (int)theParentMenuId
 }
 @end
 
-@interface AppDelegate: NSObject <NSApplicationDelegate>
+@interface AppDelegate: NSObject <NSApplicationDelegate, NSMenuDelegate>
   - (void) add_or_update_menu_item:(MenuItem*) item;
   - (IBAction)menuHandler:(id)sender;
+  - (void)menu:(NSMenu *)menu willHighlightItem:(NSMenuItem *)item;
+  - (void)menuDidClose:(NSMenu *)menu;
   @property (assign) IBOutlet NSWindow *window;
   @end
 
@@ -70,6 +72,8 @@ withParentMenuId: (int)theParentMenuId
   self->statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
   self->menu = [[NSMenu alloc] init];
   [self->menu setAutoenablesItems: FALSE];
+  // 菜单高亮变化（鼠标移到某项上）通过 NSMenuDelegate 上报，供 hover 类交互使用
+  [self->menu setDelegate:self];
   [self->statusItem setMenu:self->menu];
   systray_ready();
 }
@@ -155,6 +159,7 @@ static int count_tag_occurrences(NSMenu* menu, NSInteger tag) {
     if (!parentItem.hasSubmenu) {
       NSMenu *sub = [[NSMenu alloc] init];
       [sub setAutoenablesItems:NO];
+      [sub setDelegate:self];
       [parentItem setSubmenu:sub];
     }
     // 一律以父节点当前实际持有的子菜单为准。
@@ -191,6 +196,25 @@ static int count_tag_occurrences(NSMenu* menu, NSInteger tag) {
     report_anomaly(@"systray: duplicate item %d (%@) detected in menu tree",
                    menuId, item->title);
   }
+}
+
+// 鼠标（或键盘）在菜单里高亮某项时回调。representedObject 为 nil 时（分隔线、
+// 子菜单标题等）按 0 上报，等价于「没有高亮项」。
+- (void)menu:(NSMenu *)menu willHighlightItem:(NSMenuItem *)item
+{
+  int menuId = 0;
+  if (item != nil) {
+    NSNumber *n = [item representedObject];
+    if (n != nil) {
+      menuId = [n intValue];
+    }
+  }
+  systray_menu_item_hovered(menuId);
+}
+
+- (void)menuDidClose:(NSMenu *)menu
+{
+  systray_menu_closed();
 }
 
 NSMenuItem *find_menu_item(NSMenu *ourMenu, NSNumber *menuId) {

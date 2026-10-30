@@ -267,13 +267,35 @@ func (t *winTray) wndProc(hWnd windows.Handle, message uint32, wParam, lParam ui
 		WM_RBUTTONUP  = 0x0205
 		WM_LBUTTONUP  = 0x0202
 		WM_COMMAND    = 0x0111
+		WM_MENUSELECT = 0x011F
 		WM_ENDSESSION = 0x0016
 		WM_CLOSE      = 0x0010
 		WM_DESTROY    = 0x0002
 		// NIN_BALLOONUSERCLICK: the user clicked the balloon (WM_USER + 5).
 		NIN_BALLOONUSERCLICK = 0x0405
+		// Flags reported in the high word of WM_MENUSELECT's wParam.
+		mfPopup     = 0x00000010
+		mfSeparator = 0x00000800
 	)
 	switch message {
+	// Sent to the menu's owner window whenever the highlighted item changes —
+	// including when the popup closes (wParam 0xFFFFFFFF, lParam 0). It only
+	// ever reports the selection, so no UI work may happen here: the event is
+	// handed to whoever listens on the item's HoveredCh.
+	case WM_MENUSELECT:
+		flags := uint32(wParam >> 16)
+		sel := uint32(wParam & 0xFFFF)
+		if lParam == 0 && flags == 0xFFFF {
+			systrayMenuClosed()
+			return 0
+		}
+		// A submenu header or a separator carries no id we could dispatch.
+		if flags&mfPopup != 0 || flags&mfSeparator != 0 {
+			systrayMenuItemHovered(0)
+			return 0
+		}
+		systrayMenuItemHovered(sel)
+		return 0
 	case WM_COMMAND:
 		menuItemId := int32(wParam)
 		// https://docs.microsoft.com/en-us/windows/win32/menurc/wm-command#menus

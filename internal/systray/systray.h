@@ -3,6 +3,9 @@
 extern void systray_ready();
 extern void systray_on_exit();
 extern void systray_menu_item_selected(int menu_id);
+// menu_id 0 means "nothing is highlighted any more".
+extern void systray_menu_item_hovered(int menu_id);
+extern void systray_menu_closed();
 void registerSystray(void);
 int nativeLoop(void);
 
