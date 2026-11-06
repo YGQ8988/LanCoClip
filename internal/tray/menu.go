@@ -56,7 +56,7 @@ func run(app App, confirmClear func() bool, openURL func(string), opts Options) 
 	// tooltip 刻意留空：macOS 会在 hover 约 1 秒后弹出菜单项自身的系统
 	// tooltip，正好盖在二维码浮窗上，而用途已经由浮窗表达了。
 	mQR := systray.AddMenuItem("访问二维码", "")
-	mSettings := systray.AddMenuItem("设置", "打开页面并弹出设置（文本/图片保留条数/）")
+	mSettings := systray.AddMenuItem("设置", "打开页面并弹出设置（保留条数、快捷键、开机自启）")
 
 	// 历史：30 条，每 10 条一组（组名直接标号 1-10 / 11-20 / 21-30），
 	// 点击条目复制回剪贴板并模拟粘贴。

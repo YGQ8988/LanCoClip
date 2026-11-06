@@ -106,8 +106,13 @@ func main() {
 	}()
 
 	httpSrv := &http.Server{
-		Handler:           srv.Routes(),
+		Handler: srv.Routes(),
+		// 上传/下载图片可能到几十 MB，WriteTimeout 放宽到 60s 避免慢一点的
+		// 局域网被误断；IdleTimeout 负责回收长期占着的空闲连接。
 		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	go func() {
@@ -165,9 +170,31 @@ func setupFileLogging() {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return
 	}
-	f, err := os.OpenFile(filepath.Join(dir, "app.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	logPath := filepath.Join(dir, "app.log")
+	rotateLogIfNeeded(logPath)
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return
 	}
 	log.SetOutput(io.MultiWriter(os.Stderr, f))
+}
+
+const (
+	// 常驻后台的程序不能让 app.log 无限增长：超过 2 MiB 就换一份，
+	// 只保留上一轮备份，占用上限约 4 MiB。
+	maxLogBytes = 2 << 20
+)
+
+// rotateLogIfNeeded moves an oversized log aside. Best-effort: if the rename
+// fails we keep appending to the existing file rather than losing the trail.
+func rotateLogIfNeeded(path string) {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() < maxLogBytes {
+		return
+	}
+	backup := path + ".1"
+	_ = os.Remove(backup) // Windows 上 Rename 不覆盖已存在的目标
+	if err := os.Rename(path, backup); err != nil {
+		log.Printf("rotate log: %v", err)
+	}
 }

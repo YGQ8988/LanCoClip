@@ -146,11 +146,23 @@ func writeForbidden(w http.ResponseWriter, action string) {
 	writeJSON(w, http.StatusForbidden, map[string]any{"error": "仅服务本机可" + action})
 }
 
-func (s *Server) handleClear(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+// allowMethods rejects every method the endpoint does not accept, so handlers
+// stay focused on the request itself. All /api/* 405s share this body and the
+// standard Allow header instead of repeating the check in each handler.
+func allowMethods(next http.HandlerFunc, methods ...string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		for _, m := range methods {
+			if r.Method == m {
+				next(w, r)
+				return
+			}
+		}
+		w.Header().Set("Allow", strings.Join(methods, ", "))
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
-		return
 	}
+}
+
+func (s *Server) handleClear(w http.ResponseWriter, r *http.Request) {
 	if !s.canClear(r) {
 		writeForbidden(w, "清空记录")
 		return
@@ -250,9 +262,8 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			resp["trimmedImage"] = trimmedImage
 		}
 		writeJSON(w, http.StatusOK, resp)
-	default:
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 	}
+	// 其它方法由 Routes 上的 allowMethods 统一拦成 405。
 }
 
 // hotkeyOrDefault turns an empty combo (meaning "reset to default") into the
@@ -303,10 +314,6 @@ func (s *Server) handleImage(w http.ResponseWriter, r *http.Request) {
 // Only the local machine's own page is allowed to do this: copies made on a
 // phone never touch this machine's lancoclip.
 func (s *Server) handleSuppress(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
-		return
-	}
 	if !s.canClear(r) {
 		writeForbidden(w, "忽略记录")
 		return
@@ -364,10 +371,6 @@ var pngMagic = []byte("\x89PNG\r\n\x1a\n")
 // Unlike /api/clear it is deliberately open to the LAN: sending something to
 // the PC is the whole point, and the PC's own lancoclip is untouched.
 func (s *Server) handleAddText(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
-		return
-	}
 	var body struct {
 		Content string `json:"content"`
 	}
@@ -396,10 +399,6 @@ func (s *Server) handleAddText(w http.ResponseWriter, r *http.Request) {
 // as a new record. Uploads are normalised to PNG — the only format the store
 // keeps, since /api/image serves everything back as image/png.
 func (s *Server) handleAddImage(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
-		return
-	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
 	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "上传失败或图片过大"})
@@ -450,7 +449,13 @@ func (s *Server) handleAddImage(w http.ResponseWriter, r *http.Request) {
 // phone's photo library, GIF…) is decoded and re-encoded.
 func toPNGBytes(raw []byte) ([]byte, error) {
 	if bytes.HasPrefix(raw, pngMagic) {
-		if _, err := png.DecodeConfig(bytes.NewReader(raw)); err == nil {
+		cfg, err := png.DecodeConfig(bytes.NewReader(raw))
+		if err == nil {
+			// 透传之前也要挡尺寸：解码成 RGBA 的内存开销与编码格式无关，
+			// 不能因为「PNG 不重新编码」就放过超高像素的图。
+			if err := checkImagePixels(cfg.Width, cfg.Height); err != nil {
+				return nil, err
+			}
 			return raw, nil
 		}
 	}
@@ -458,8 +463,8 @@ func toPNGBytes(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if int64(cfg.Width)*int64(cfg.Height) > maxImagePixels {
-		return nil, errors.New("image too large")
+	if err := checkImagePixels(cfg.Width, cfg.Height); err != nil {
+		return nil, err
 	}
 	img, _, err := image.Decode(bytes.NewReader(raw))
 	if err != nil {
@@ -470,6 +475,14 @@ func toPNGBytes(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// checkImagePixels 挡住极端尺寸（解码成 RGBA 会吃掉几百 MB 内存）。
+func checkImagePixels(w, h int) error {
+	if int64(w)*int64(h) > maxImagePixels {
+		return errors.New("image too large")
+	}
+	return nil
 }
 
 func (s *Server) handleQR(w http.ResponseWriter, r *http.Request) {
@@ -498,10 +511,6 @@ func (s *Server) handleQR(w http.ResponseWriter, r *http.Request) {
 // Machine-local only — a phone on the LAN must not be able to trigger a
 // desktop notification.
 func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
-		return
-	}
 	if !s.canClear(r) {
 		writeForbidden(w, "重复启动提示")
 		return
@@ -593,13 +602,13 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/appicon.png", s.handleAppIcon)
 	mux.HandleFunc("/api/records", s.handleRecords)
 	mux.HandleFunc("/api/recent", s.handleRecent)
-	mux.HandleFunc("/api/clear", s.handleClear)
-	mux.HandleFunc("/api/suppress", s.handleSuppress)
+	mux.HandleFunc("/api/clear", allowMethods(s.handleClear, http.MethodPost))
+	mux.HandleFunc("/api/suppress", allowMethods(s.handleSuppress, http.MethodPost))
 	mux.HandleFunc("/api/image", s.handleImage)
-	mux.HandleFunc("/api/add-text", s.handleAddText)
-	mux.HandleFunc("/api/add-image", s.handleAddImage)
+	mux.HandleFunc("/api/add-text", allowMethods(s.handleAddText, http.MethodPost))
+	mux.HandleFunc("/api/add-image", allowMethods(s.handleAddImage, http.MethodPost))
 	mux.HandleFunc("/api/qr", s.handleQR)
-	mux.HandleFunc("/api/settings", s.handleSettings)
-	mux.HandleFunc("/api/activate", s.handleActivate)
+	mux.HandleFunc("/api/settings", allowMethods(s.handleSettings, http.MethodGet, http.MethodPost))
+	mux.HandleFunc("/api/activate", allowMethods(s.handleActivate, http.MethodPost))
 	return mux
 }

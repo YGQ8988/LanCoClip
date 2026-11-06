@@ -4,11 +4,10 @@ Package systray is a cross-platform Go library to place an icon and menu in the 
 package systray
 
 import (
+	"log"
 	"runtime"
 	"sync"
 	"sync/atomic"
-
-	"github.com/getlantern/golog"
 )
 
 // anomalyHook 收到原生菜单层加固逻辑（父节点缺失、意外新增、同 id 重复）
@@ -37,8 +36,6 @@ func reportAnomaly(msg string) {
 }
 
 var (
-	log = golog.LoggerFor("systray")
-
 	systrayReady  func()
 	systrayExit   func()
 	menuItems     = make(map[uint32]*MenuItem)
@@ -203,7 +200,7 @@ func systrayMenuItemSelected(id uint32) {
 	item, ok := menuItems[id]
 	menuItemsLock.RUnlock()
 	if !ok {
-		log.Errorf("No menu item with ID %v", id)
+		log.Printf("[systray] No menu item with ID %v", id)
 		return
 	}
 	select {

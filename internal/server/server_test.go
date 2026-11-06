@@ -2,8 +2,10 @@ package server
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"image"
 	"image/jpeg"
 	"image/png"
@@ -797,5 +799,51 @@ func TestHandleAddFromPhone(t *testing.T) {
 	}
 	if _, err := png.Decode(bytes.NewReader(raw)); err != nil {
 		t.Fatalf("stored image is not a valid PNG: %v", err)
+	}
+}
+
+// 去年同月同日不能再显示成「今天 HH:MM」。
+func TestTrayItemLabelLastYear(t *testing.T) {
+	now := time.Now()
+	lastYear := time.Date(now.Year()-1, now.Month(), now.Day(), 12, 30, 0, 0, now.Location())
+	got := TrayItemLabel(store.Record{Kind: store.KindText, Content: "hi", CreatedAt: lastYear.UnixMilli()})
+	wantStamp := lastYear.Format("01-02 15:04")
+	if !strings.HasPrefix(got, wantStamp) {
+		t.Fatalf("去年同月同日应带日期前缀 %q, got %q", wantStamp, got)
+	}
+}
+
+// PNG 走透传分支，也必须挡住超高像素（否则前端解码会吃掉几百 MB）。
+func TestToPNGBytesHugePNG(t *testing.T) {
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 2, 2))); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	small := buf.Bytes()
+	if got, err := toPNGBytes(small); err != nil || !bytes.Equal(got, small) {
+		t.Fatalf("small PNG should pass through unchanged: err=%v", err)
+	}
+
+	// 只改 IHDR 里的宽高并重算 CRC：DecodeConfig 读头部就能拿到尺寸，
+	// 不需要真的分配 100000×100000 的像素。
+	huge := bytes.Clone(small)
+	binary.BigEndian.PutUint32(huge[16:20], 100000)
+	binary.BigEndian.PutUint32(huge[20:24], 100000)
+	binary.BigEndian.PutUint32(huge[29:33], crc32.ChecksumIEEE(huge[12:29]))
+	if _, err := toPNGBytes(huge); err == nil {
+		t.Fatal("huge PNG should be rejected by the pixel limit")
+	}
+}
+
+// method 校验收到 Routes 的包装器里后，405 仍统一且带 Allow 头。
+func TestAllowMethods(t *testing.T) {
+	s := newTestServer(t)
+	postOnly := serve(s, http.MethodPut, "/api/clear", "127.0.0.1:5000", "", "")
+	if postOnly.Code != http.StatusMethodNotAllowed || postOnly.Header().Get("Allow") != "POST" {
+		t.Fatalf("POST-only 405 = %d, Allow = %q", postOnly.Code, postOnly.Header().Get("Allow"))
+	}
+	settings := serve(s, http.MethodPut, "/api/settings", "127.0.0.1:5000", "", "")
+	if settings.Code != http.StatusMethodNotAllowed || settings.Header().Get("Allow") != "GET, POST" {
+		t.Fatalf("settings 405 = %d, Allow = %q", settings.Code, settings.Header().Get("Allow"))
 	}
 }

@@ -173,7 +173,8 @@ func TrayItemLabel(r store.Record) string {
 	t := time.UnixMilli(r.CreatedAt)
 	now := time.Now()
 	stamp := t.Format("15:04")
-	if t.Day() != now.Day() || t.Month() != now.Month() {
+	// 年/月/日都要比：只比 Day+Month 会把「去年同月同日」误判成今天。
+	if t.Year() != now.Year() || t.Month() != now.Month() || t.Day() != now.Day() {
 		stamp = t.Format("01-02 15:04")
 	}
 	if r.Kind == store.KindImage {
