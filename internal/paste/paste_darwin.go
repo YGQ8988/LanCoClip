@@ -6,6 +6,7 @@
 package paste
 
 /*
+#cgo darwin CFLAGS: -fobjc-arc
 #cgo LDFLAGS: -framework CoreGraphics -framework ApplicationServices -framework Foundation -framework AppKit
 #include <ApplicationServices/ApplicationServices.h>
 
@@ -15,9 +16,12 @@ void pastePostCmdV(void);
 */
 import "C"
 
-import "errors"
+import (
+	"errors"
+	"sync/atomic"
+)
 
-var prompted bool // 只在首次未授权时弹一次系统授权提示
+var prompted atomic.Bool // 只在首次未授权时弹一次系统授权提示
 
 // FreezeFocus is a no-op on macOS: Do() targets the frontmost app directly
 // (CGEventPostToPid), no focus restoration is needed.
@@ -27,8 +31,9 @@ func FreezeFocus() {}
 // permission is missing triggers the system prompt (macOS requires 辅助功能
 // permission to post keyboard events) and returns an error.
 func Do() error {
-	trusted := C.pasteTrusted(boolToInt(!prompted))
-	prompted = true
+	// CompareAndSwap 保证并发调用下只有一个 goroutine 会触发授权提示。
+	shouldPrompt := prompted.CompareAndSwap(false, true)
+	trusted := C.pasteTrusted(boolToInt(shouldPrompt))
 	if trusted == 0 {
 		return errors.New("需要辅助功能权限才能模拟粘贴（系统已弹出授权提示）")
 	}

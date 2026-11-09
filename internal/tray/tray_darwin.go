@@ -3,6 +3,7 @@
 package tray
 
 /*
+#cgo darwin CFLAGS: -fobjc-arc
 #cgo LDFLAGS: -framework Cocoa -framework AppKit
 // Implemented in forceSetTemplateIcon_darwin.m (compiled by cgo as Objective-C).
 void forceSetTemplateIcon(const char *bytes, int length);
@@ -54,7 +55,7 @@ func Run(app App, opts Options) {
 		}
 
 		run(app, confirmClearAll, open.Open, opts)
-	}, func() {})
+	}, func() { stopMenuLoops() })
 }
 
 // confirmClearAll shows a native confirmation dialog for "清除历史".
@@ -71,5 +72,13 @@ func confirmClearAll() bool {
 	return strings.Contains(string(out), "button returned:清除")
 }
 
+// stopPlatformLoops is a no-op on macOS: the only long-lived background
+// goroutines there belong to run() and are already stopped by stopMenuLoops.
+func stopPlatformLoops() {}
+
+// networkHint has no macOS counterpart: the firewall prompt on macOS is per-app
+// and signed apps are allowed by default, so there is nothing to troubleshoot.
+func networkHint() (string, func()) { return "", nil }
+
 // Quit asks the menu-bar loop to stop.
-func Quit() { systray.Quit() }
+func Quit() { stopMenuLoops(); stopPlatformLoops(); systray.Quit() }

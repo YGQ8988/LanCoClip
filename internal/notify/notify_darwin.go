@@ -3,6 +3,7 @@
 package notify
 
 /*
+#cgo darwin CFLAGS: -fobjc-arc
 #cgo LDFLAGS: -framework Cocoa -framework UserNotifications
 
 #include <stdbool.h>
@@ -22,7 +23,7 @@ import (
 var (
 	clickMu   sync.Mutex
 	clickFn   func()
-	delivered bool // at least one Notify call got through, so clicks may arrive
+	delivered bool // 通知已投递、且点击回调尚未被消费
 )
 
 // Supported reports whether notifications can be delivered. macOS only allows
@@ -47,6 +48,11 @@ func Notify(title, body string, onClick func()) error {
 	clickMu.Unlock()
 
 	if C.lcpNotify(ct, cb) != 0 {
+		// 投递失败：清掉刚设置的回调，避免之后点击别的历史通知误触发。
+		clickMu.Lock()
+		clickFn = nil
+		delivered = false
+		clickMu.Unlock()
 		return ErrUnsupported
 	}
 	return nil
@@ -60,6 +66,8 @@ func goNotifyClicked() {
 	clickMu.Lock()
 	fn := clickFn
 	ok := delivered
+	clickFn = nil     // 取出即清空，避免闭包长期持有
+	delivered = false // 复位：点击任意历史通知不会再执行上一次的回调
 	clickMu.Unlock()
 	if ok && fn != nil {
 		go fn()

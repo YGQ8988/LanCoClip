@@ -13,10 +13,14 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"lanoclip/internal/lanaddr"
@@ -51,6 +55,8 @@ func newTestServer(t *testing.T) *Server {
 // inline: building the request, setting RemoteAddr / User-Agent, and dispatching.
 func serve(s *Server, method, target, remote, ua, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, target, strings.NewReader(body))
+	// Routes 最外层有 Host 白名单；测试统一模拟从服务本机打开页面。
+	req.Host = "127.0.0.1:6116"
 	req.RemoteAddr = remote
 	if ua != "" {
 		req.Header.Set("User-Agent", ua)
@@ -72,6 +78,9 @@ func decodeJSON(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 }
 
 func TestCanClear(t *testing.T) {
+	// canClear 只按来源 IP 判定，User-Agent / Sec-CH-UA-Mobile 一律不参与：
+	// 本机任意进程可调用特权接口是产品取舍（用户明确不做鉴权）。
+	// ua 列仍保留，正是为了证明同一 IP 换任何 UA 结果都不变。
 	s := &Server{localIPs: map[string]bool{"192.168.1.10": true}}
 
 	cases := []struct {
@@ -85,37 +94,13 @@ func TestCanClear(t *testing.T) {
 		{"own LAN address", "192.168.1.10:5000", "Mozilla/5.0 (Macintosh)", true},
 		{"other device on LAN", "192.168.1.99:5000", "Mozilla/5.0 (Macintosh)", false},
 		{"other network", "10.0.0.5:5000", "Mozilla/5.0 (Macintosh)", false},
-		{"mobile even from loopback", "127.0.0.1:5000", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile/15E148 Safari/604.1", false},
-		{"mobile via local proxy", "192.168.1.10:5000", "Mozilla/5.0 (Linux; Android 14) Mobile Safari", false},
+		{"mobile UA from loopback is local", "127.0.0.1:5000", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile/15E148 Safari/604.1", true},
+		{"mobile UA via own LAN IP is local", "192.168.1.10:5000", "Mozilla/5.0 (Linux; Android 14) Mobile Safari", true},
 	}
 	for _, c := range cases {
 		r := &http.Request{RemoteAddr: c.remote, Header: http.Header{"User-Agent": []string{c.ua}}}
 		if got := s.canClear(r); got != c.want {
 			t.Errorf("%s: canClear(%s, %q) = %v, want %v", c.name, c.remote, c.ua, got, c.want)
-		}
-	}
-}
-
-func TestIsMobileUA(t *testing.T) {
-	mobile := []string{
-		"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148",
-		"Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36",
-		"Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) Mobile/15E148",
-		"Mozilla/5.0 (Linux; Android 13; wv) MicroMessenger/8.0",
-	}
-	desktop := []string{
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15",
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
-		"curl/8.4.0",
-	}
-	for _, ua := range mobile {
-		if !isMobileUA(ua) {
-			t.Errorf("expected mobile: %s", ua)
-		}
-	}
-	for _, ua := range desktop {
-		if isMobileUA(ua) {
-			t.Errorf("expected desktop: %s", ua)
 		}
 	}
 }
@@ -210,11 +195,15 @@ func TestHandleSuppress(t *testing.T) {
 		t.Fatalf("duplicate should be retracted, got %d texts", tc)
 	}
 
-	// 手机：不允许（手机上复制不经过本机剪贴板）
+	// 非本机来源（手机经 LAN 访问）→ 403；只按 RemoteAddr 判定，与 UA 无关。
 	s2 := newTestServer(t)
-	rec2 := post(s2, "127.0.0.1:5000", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile/15E148", `{"kind":"text","content":"x"}`)
+	rec2 := post(s2, "192.168.1.99:5000", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile/15E148", `{"kind":"text","content":"x"}`)
 	if rec2.Code != http.StatusForbidden {
-		t.Fatalf("mobile suppress = %d, want 403", rec2.Code)
+		t.Fatalf("non-local suppress = %d, want 403", rec2.Code)
+	}
+	// 反过来：本机回环即便带手机 UA 也放行（UA 不是安全边界）。
+	if rec := post(s2, "127.0.0.1:5000", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile/15E148", `{"kind":"text","content":"y"}`); rec.Code != http.StatusOK {
+		t.Fatalf("local suppress with mobile UA = %d, want 200", rec.Code)
 	}
 
 	// 未知图片 / 空内容
@@ -229,23 +218,6 @@ func TestHandleSuppress(t *testing.T) {
 	recGET := serve(s3, http.MethodGet, "/api/suppress", "127.0.0.1:5000", "", "")
 	if recGET.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("GET = %d, want 405", recGET.Code)
-	}
-}
-
-func TestIsMobileRequest(t *testing.T) {
-	// Client Hint wins even when the User-Agent looks like a desktop one
-	// (e.g. a proxy that rewrites the UA).
-	req := httptest.NewRequest(http.MethodGet, "/api/records", nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15")
-	req.Header.Set("Sec-CH-UA-Mobile", "?1")
-	if !isMobileRequest(req) {
-		t.Error("Sec-CH-UA-Mobile: ?1 should be detected as mobile")
-	}
-
-	req2 := httptest.NewRequest(http.MethodGet, "/api/records", nil)
-	req2.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15")
-	if isMobileRequest(req2) {
-		t.Error("desktop request should not be detected as mobile")
 	}
 }
 
@@ -336,10 +308,10 @@ func TestHandleSettings(t *testing.T) {
 		t.Fatalf("texts after POST = %d, want 10", tc)
 	}
 
-	// POST：手机 / 其他设备不允许
+	// POST：本机回环（哪怕带手机 UA）允许，非本机 IP 拒绝 —— 只看来源 IP。
 	s2 := newTestServer(t)
-	if rec := post(s2, "127.0.0.1:5000", mobileUA, `{"maxText":10,"maxImage":10}`); rec.Code != http.StatusForbidden {
-		t.Fatalf("mobile POST = %d, want 403", rec.Code)
+	if rec := post(s2, "127.0.0.1:5000", mobileUA, `{"maxText":10,"maxImage":10}`); rec.Code != http.StatusOK {
+		t.Fatalf("local POST with mobile UA = %d, want 200", rec.Code)
 	}
 	if rec := post(s2, "192.168.1.99:5000", desktopUA, `{"maxText":10,"maxImage":10}`); rec.Code != http.StatusForbidden {
 		t.Fatalf("remote POST = %d, want 403", rec.Code)
@@ -350,8 +322,14 @@ func TestHandleSettings(t *testing.T) {
 	if rec := post(s3, "127.0.0.1:5000", desktopUA, `not-json`); rec.Code != http.StatusBadRequest {
 		t.Fatalf("bad json POST = %d, want 400", rec.Code)
 	}
-	if rec := post(s3, "127.0.0.1:5000", desktopUA, `{"maxText":10}`); rec.Code != http.StatusBadRequest {
-		t.Fatalf("missing field POST = %d, want 400", rec.Code)
+	// 只提交 maxText：另一个上限取当前 effective 值补齐，不再静默忽略/报错。
+	before := s3.store.MaxImage()
+	if rec := post(s3, "127.0.0.1:5000", desktopUA, `{"maxText":10}`); rec.Code != http.StatusOK {
+		t.Fatalf("single-field POST = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	if s3.store.MaxText() != 10 || s3.store.MaxImage() != before {
+		t.Fatalf("single-field POST limits = %d/%d, want 10/%d",
+			s3.store.MaxText(), s3.store.MaxImage(), before)
 	}
 
 	// 其他方法
@@ -501,10 +479,10 @@ func TestHandleSettingsAutostart(t *testing.T) {
 		t.Fatalf("autostart should stay false: %v", out)
 	}
 
-	// 手机端（无权限）POST 被拒
-	rec = serve(s, http.MethodPost, "/api/settings", "127.0.0.1:5000", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)", `{"autostart": false}`)
+	// 非本机来源（手机经 LAN 访问）POST 被拒；按 RemoteAddr 判定，与 UA 无关。
+	rec = serve(s, http.MethodPost, "/api/settings", "192.168.1.99:5000", "", `{"autostart": false}`)
 	if rec.Code != http.StatusForbidden {
-		t.Fatalf("mobile POST should be 403, got %d", rec.Code)
+		t.Fatalf("non-local POST should be 403, got %d", rec.Code)
 	}
 }
 
@@ -541,6 +519,127 @@ func TestHandleSettingsHotkeys(t *testing.T) {
 	out = decodeJSON(t, serve(s, http.MethodGet, "/api/settings", "", "", ""))
 	if out["hotkeyQR"] == "" {
 		t.Fatalf("empty combo should fall back to default, got %v", out["hotkeyQR"])
+	}
+}
+
+// 单字段 limit：只提交 maxText 或 maxImage 时，另一项保持当前 effective 值。
+func TestSettingsSingleLimitField(t *testing.T) {
+	s := newTestServer(t)
+	post := func(body string) *httptest.ResponseRecorder {
+		return serve(s, http.MethodPost, "/api/settings", "127.0.0.1:5000", "", body)
+	}
+	get := func() map[string]any {
+		return decodeJSON(t, serve(s, http.MethodGet, "/api/settings", "", "", ""))
+	}
+
+	origImage := s.store.MaxImage()
+	if rec := post(`{"maxText":100}`); rec.Code != http.StatusOK {
+		t.Fatalf("maxText only = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	out := get()
+	if out["maxText"] != float64(100) || out["maxImage"] != float64(origImage) {
+		t.Fatalf("after maxText only: %v (want 100/%d)", out, origImage)
+	}
+
+	origText := s.store.MaxText()
+	if rec := post(`{"maxImage":50}`); rec.Code != http.StatusOK {
+		t.Fatalf("maxImage only = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	out = get()
+	if out["maxText"] != float64(origText) || out["maxImage"] != float64(50) {
+		t.Fatalf("after maxImage only: %v (want %d/50)", out, origText)
+	}
+
+	// 提交的数值仍必须为正。
+	if rec := post(`{"maxText":0}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("maxText=0 = %d, want 400", rec.Code)
+	}
+}
+
+// 设置落盘失败时 limits 事务必须回滚：被裁掉的记录要放回内存，且后续
+// 成功落盘的内容不能少（RestoreTrim 生效）。
+func TestSettingsSaveFailureRestoresTrimmedRecords(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	s := &Server{
+		store:      st,
+		suppressor: lancoclip.NewSuppressor(),
+		localIPs:   map[string]bool{},
+		shareURL:   "http://127.0.0.1:6116",
+	}
+	for i := 0; i < 20; i++ {
+		st.AddText(fmt.Sprintf("keep-%02d", i))
+	}
+
+	// texts.json.tmp 预置成目录 → Save() 的 stageFile 必失败（跨平台）。
+	if err := os.Mkdir(filepath.Join(dir, "texts.json.tmp"), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	rec := serve(s, http.MethodPost, "/api/settings", "127.0.0.1:5000", "", `{"maxText":10,"maxImage":5}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("settings save failure = %d, want 500 (%s)", rec.Code, rec.Body.String())
+	}
+	// RestoreTrim 生效：20 条仍在内存里。
+	out := decodeJSON(t, serve(s, http.MethodGet, "/api/records", "127.0.0.1:5000", "", ""))
+	if out["total"] != float64(20) {
+		t.Fatalf("after failed settings total = %v, want 20", out["total"])
+	}
+	// 上限也必须回滚，否则后续 21 条会被新上限裁掉。
+	if st.MaxText() != store.DefaultMaxTextRecords || st.MaxImage() != store.DefaultMaxImageRecords {
+		t.Fatalf("limits after rollback = %d/%d, want defaults", st.MaxText(), st.MaxImage())
+	}
+
+	// 解除故障后再落盘：20 + 1 条都要写入 texts.json。
+	if err := os.Remove(filepath.Join(dir, "texts.json.tmp")); err != nil {
+		t.Fatalf("remove blocker: %v", err)
+	}
+	if rec := serve(s, http.MethodPost, "/api/add-text", "127.0.0.1:5000", "", `{"content":"after-restore"}`); rec.Code != http.StatusOK {
+		t.Fatalf("add after restore = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "texts.json"))
+	if err != nil {
+		t.Fatalf("read texts.json: %v", err)
+	}
+	var saved []store.Record
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		t.Fatalf("decode texts.json: %v", err)
+	}
+	if len(saved) != 21 {
+		t.Fatalf("texts.json has %d records, want 21", len(saved))
+	}
+}
+
+// 系统保留组合必须被拒；带 Shift 的默认组合（⌘⇧Q）不受影响。
+func TestReservedHotkeyRejected(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+		t.Skip("no system-reserved hotkey table for this platform")
+	}
+	s := newTestServer(t)
+	post := func(body string) *httptest.ResponseRecorder {
+		return serve(s, http.MethodPost, "/api/settings", "127.0.0.1:5000", "", body)
+	}
+
+	var reserved, allowed string
+	if runtime.GOOS == "darwin" {
+		reserved = `{"hotkeyQR":"meta+q","hotkeyHistory":"meta+shift+v"}`
+		allowed = `{"hotkeyQR":"meta+shift+q","hotkeyHistory":"meta+shift+v"}`
+	} else {
+		reserved = `{"hotkeyQR":"ctrl+c","hotkeyHistory":"ctrl+shift+v"}`
+		allowed = `{"hotkeyQR":"ctrl+shift+q","hotkeyHistory":"ctrl+shift+v"}`
+	}
+
+	rec := post(reserved)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("reserved combo = %d, want 400 (%s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "系统保留") {
+		t.Fatalf("reserved combo body = %s", rec.Body.String())
+	}
+	if rec := post(allowed); rec.Code != http.StatusOK {
+		t.Fatalf("allowed combo = %d, want 200 (%s)", rec.Code, rec.Body.String())
 	}
 }
 
@@ -845,5 +944,351 @@ func TestAllowMethods(t *testing.T) {
 	settings := serve(s, http.MethodPut, "/api/settings", "127.0.0.1:5000", "", "")
 	if settings.Code != http.StatusMethodNotAllowed || settings.Header().Get("Allow") != "GET, POST" {
 		t.Fatalf("settings 405 = %d, Allow = %q", settings.Code, settings.Header().Get("Allow"))
+	}
+}
+
+// 暂停开关：可单独提交、状态跨接口可见、暂停期间推送不入库。
+func TestSettingsPausedAndStatus(t *testing.T) {
+	s := newTestServer(t)
+	remote := "127.0.0.1:5000"
+	desktopUA := "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15"
+
+	get := serve(s, http.MethodGet, "/api/settings", remote, desktopUA, "")
+	if get.Code != http.StatusOK {
+		t.Fatalf("GET settings = %d", get.Code)
+	}
+	if out := decodeJSON(t, get); out["paused"] != false {
+		t.Fatalf("default paused = %v, want false", out["paused"])
+	}
+
+	// 单独提交 paused（不带 maxText/maxImage）也应通过校验
+	post := serve(s, http.MethodPost, "/api/settings", remote, desktopUA, `{"paused":true}`)
+	if post.Code != http.StatusOK {
+		t.Fatalf("POST paused = %d: %s", post.Code, post.Body.String())
+	}
+	if out := decodeJSON(t, post); out["paused"] != true {
+		t.Fatalf("POST paused response = %v", out["paused"])
+	}
+	if !s.store.Paused() {
+		t.Fatal("store should be paused")
+	}
+
+	recs := serve(s, http.MethodGet, "/api/records", remote, desktopUA, "")
+	out := decodeJSON(t, recs)
+	if out["paused"] != true {
+		t.Fatalf("records paused = %v, want true", out["paused"])
+	}
+	if _, ok := out["storageError"]; !ok {
+		t.Fatal("records should expose storageError")
+	}
+
+	add := serve(s, http.MethodPost, "/api/add-text", remote, desktopUA, `{"content":"secret"}`)
+	addOut := decodeJSON(t, add)
+	if addOut["paused"] != true || addOut["added"] != false {
+		t.Fatalf("add while paused = %v", addOut)
+	}
+	if _, total := s.store.Page(store.KindText, 1, 10); total != 0 {
+		t.Fatalf("paused add must not create a record, total = %d", total)
+	}
+
+	resume := serve(s, http.MethodPost, "/api/settings", remote, desktopUA, `{"paused":false}`)
+	if resume.Code != http.StatusOK || s.store.Paused() {
+		t.Fatalf("resume = %d, paused = %v", resume.Code, s.store.Paused())
+	}
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	s := newTestServer(t)
+	rec := serve(s, http.MethodGet, "/api/records", "127.0.0.1:5000", "", "")
+	h := rec.Header()
+	if h.Get("X-Content-Type-Options") != "nosniff" {
+		t.Errorf("nosniff missing: %q", h.Get("X-Content-Type-Options"))
+	}
+	if h.Get("X-Frame-Options") != "SAMEORIGIN" {
+		t.Errorf("X-Frame-Options = %q", h.Get("X-Frame-Options"))
+	}
+	if h.Get("Referrer-Policy") != "no-referrer" {
+		t.Errorf("Referrer-Policy = %q", h.Get("Referrer-Policy"))
+	}
+	if !strings.Contains(h.Get("Content-Security-Policy"), "frame-ancestors 'self'") {
+		t.Errorf("CSP = %q", h.Get("Content-Security-Policy"))
+	}
+	csp := h.Get("Content-Security-Policy")
+	if strings.Contains(csp, "unsafe-inline") {
+		t.Errorf("CSP must not allow unsafe-inline: %q", csp)
+	}
+	if !strings.Contains(csp, "script-src 'self'") || !strings.Contains(csp, "style-src 'self'") {
+		t.Errorf("CSP script/style directives = %q", csp)
+	}
+	// 剪贴板正文不得被浏览器或中间代理缓存。
+	if !strings.Contains(h.Get("Cache-Control"), "no-store") {
+		t.Errorf("Cache-Control = %q, want no-store", h.Get("Cache-Control"))
+	}
+	if h.Get("Pragma") != "no-cache" {
+		t.Errorf("Pragma = %q, want no-cache", h.Get("Pragma"))
+	}
+	if h.Get("Expires") != "0" {
+		t.Errorf("Expires = %q, want 0", h.Get("Expires"))
+	}
+	if h.Get("Cross-Origin-Resource-Policy") != "same-origin" {
+		t.Errorf("CORP = %q, want same-origin", h.Get("Cross-Origin-Resource-Policy"))
+	}
+	if h.Get("Vary") != "Origin" {
+		t.Errorf("Vary = %q, want Origin", h.Get("Vary"))
+	}
+}
+
+// 静态资源：/app.js /theme.js /app.css 从注入的 webFS 读取，Content-Type
+// 正确且禁用缓存；文件缺失时 404。
+func TestStaticAssetRoutes(t *testing.T) {
+	s := newTestServer(t)
+	s.webFS = fstest.MapFS{
+		"web/app.js":   {Data: []byte("console.log('app')")},
+		"web/theme.js": {Data: []byte("/* theme */")},
+		"web/app.css":  {Data: []byte("body{}")},
+	}
+	cases := []struct{ path, ctype string }{
+		{"/app.js", "application/javascript; charset=utf-8"},
+		{"/theme.js", "application/javascript; charset=utf-8"},
+		{"/app.css", "text/css; charset=utf-8"},
+	}
+	for _, c := range cases {
+		rec := serve(s, http.MethodGet, c.path, "127.0.0.1:5000", "", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s = %d, want 200", c.path, rec.Code)
+		}
+		if got := rec.Header().Get("Content-Type"); got != c.ctype {
+			t.Fatalf("%s Content-Type = %q, want %q", c.path, got, c.ctype)
+		}
+		if !strings.Contains(rec.Header().Get("Cache-Control"), "no-store") {
+			t.Fatalf("%s must be no-store: %q", c.path, rec.Header().Get("Cache-Control"))
+		}
+	}
+
+	// 未注入文件（或文件缺失）→ 404，而不是 500 / 空 200。
+	empty := newTestServer(t)
+	empty.webFS = fstest.MapFS{}
+	for _, c := range cases {
+		if rec := serve(empty, http.MethodGet, c.path, "127.0.0.1:5000", "", ""); rec.Code != http.StatusNotFound {
+			t.Fatalf("missing %s = %d, want 404", c.path, rec.Code)
+		}
+	}
+}
+
+// /api/qr 只允许生成本服务地址：loopback / 本机网卡地址 / 请求 Host。
+func TestHandleQRRestrictedToServiceAddress(t *testing.T) {
+	s := newTestServer(t)
+	s.localIPs["192.168.1.10"] = true
+
+	q := func(text string) *httptest.ResponseRecorder {
+		return serve(s, http.MethodGet, "/api/qr?text="+url.QueryEscape(text), "127.0.0.1:5000", "", "")
+	}
+	for _, ok := range []string{
+		"http://192.168.1.10:6116",
+		"http://127.0.0.1:6116",
+		"http://localhost:6116",
+		"http://[::1]:6116",
+	} {
+		if rec := q(ok); rec.Code != http.StatusOK {
+			t.Fatalf("qr for %q = %d, want 200 (%s)", ok, rec.Code, rec.Body.String())
+		}
+	}
+	for _, bad := range []string{
+		"https://evil.example/steal",
+		"http://169.254.169.254/latest/meta-data",
+		"javascript:alert(1)",
+		"not a url",
+	} {
+		if rec := q(bad); rec.Code != http.StatusBadRequest {
+			t.Fatalf("qr for %q = %d, want 400", bad, rec.Code)
+		}
+	}
+	// C0/C1 控制字符被剔除后再编码：\r\n / ESC 不会影响地址判定。
+	if rec := q("http://127.0.0.1:6116/a\r\n\x1b"); rec.Code != http.StatusOK {
+		t.Fatalf("control chars should be stripped: %d (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+func TestQRTextTooLong(t *testing.T) {
+	s := newTestServer(t)
+	long := "/api/qr?text=" + strings.Repeat("a", maxQRTextBytes+1)
+	if rec := serve(s, http.MethodGet, long, "127.0.0.1:5000", "", ""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("oversized QR text = %d, want 400", rec.Code)
+	}
+	if rec := serve(s, http.MethodGet, "/api/qr", "127.0.0.1:5000", "", ""); rec.Code != http.StatusOK {
+		t.Fatalf("default QR = %d, want 200", rec.Code)
+	}
+}
+
+// ── 磁盘水位 fail-closed / 写接口落盘失败 5xx ────────────────────────────
+
+func TestGuardDiskUsageErrorFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	s := &Server{
+		store:      st,
+		suppressor: lancoclip.NewSuppressor(),
+		localIPs:   map[string]bool{},
+		shareURL:   "http://127.0.0.1:6116",
+	}
+	// 数据目录消失 → DiskUsage() 返回 err；写接口必须 503 而不是放行。
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatalf("RemoveAll: %v", err)
+	}
+	rec := guardedServeBody(s, http.MethodPost, "/api/add-text",
+		map[string]string{"Content-Type": "application/json"}, `{"content":"x"}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("disk usage error = %d, want 503 (%s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "暂时无法确认存储空间") {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+func TestWriteEndpointsReturn5xxOnSaveFailure(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	// 把 texts.json.tmp 预置成目录 → Save() 的 stageFile(os.WriteFile) 必失败，
+	// 跨平台、与权限 / root 无关。
+	if err := os.Mkdir(filepath.Join(dir, "texts.json.tmp"), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	s := &Server{
+		store:      st,
+		suppressor: lancoclip.NewSuppressor(),
+		localIPs:   map[string]bool{},
+		shareURL:   "http://127.0.0.1:6116",
+	}
+	cases := []struct{ method, target, body string }{
+		{http.MethodPost, "/api/clear", "{}"},
+		{http.MethodPost, "/api/add-text", `{"content":"x"}`},
+	}
+	for _, c := range cases {
+		rec := guardedServeBody(s, c.method, c.target,
+			map[string]string{"Content-Type": "application/json"}, c.body)
+		if rec.Code < 500 || rec.Code > 599 {
+			t.Fatalf("%s = %d, want 5xx (%s)", c.target, rec.Code, rec.Body.String())
+		}
+		if strings.Contains(rec.Body.String(), `"ok":true`) {
+			t.Fatalf("%s must not report ok on save failure: %s", c.target, rec.Body.String())
+		}
+	}
+}
+
+// ── /api/image：正常服务与软链拒绝 ───────────────────────────────────────
+
+func TestHandleImageServesAndRejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	s := &Server{
+		store:      st,
+		suppressor: lancoclip.NewSuppressor(),
+		localIPs:   map[string]bool{},
+		shareURL:   "http://127.0.0.1:6116",
+	}
+	pngBytes := []byte("store-accepts-arbitrary-bytes")
+	if added, err := st.AddImage(pngBytes); err != nil || !added {
+		t.Fatalf("AddImage: added=%v err=%v", added, err)
+	}
+	recs, _ := st.Page(store.KindImage, 1, 1)
+	if len(recs) != 1 {
+		t.Fatal("no image record")
+	}
+	path, ok := st.ImagePath(recs[0].ID)
+	if !ok {
+		t.Fatal("ImagePath missing")
+	}
+	target := "/api/image?id=" + strconv.FormatInt(recs[0].ID, 10)
+
+	// 正常图片：200 + image/png + nosniff，且不再经过 ServeFile 的路径协商。
+	rec := serve(s, http.MethodGet, target, "127.0.0.1:5000", "", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("image GET = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("Content-Type") != "image/png" ||
+		rec.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("headers: %v", rec.Header())
+	}
+	if rec.Body.String() != string(pngBytes) {
+		t.Fatalf("body = %q, want %q", rec.Body.String(), pngBytes)
+	}
+
+	// 把图片文件换成指向数据目录之外的软链：必须被拒绝（404）。
+	secret := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(secret, []byte("SECRET"), 0o600); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove image: %v", err)
+	}
+	if err := os.Symlink(secret, path); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	rec = serve(s, http.MethodGet, target, "127.0.0.1:5000", "", "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("symlinked image = %d, want 404", rec.Code)
+	}
+}
+
+// ── 单实例探测：禁重定向 / URL 白名单 ───────────────────────────────────
+
+func TestRunningInstanceURLRejectsForeignURL(t *testing.T) {
+	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "app": "lanoclip", "url": "https://evil.example/steal",
+		})
+	}))
+	defer evil.Close()
+	if got := runningInstanceURL(portOf(t, evil.URL), 1); got != "" {
+		t.Fatalf("foreign URL should be rejected, got %q", got)
+	}
+}
+
+func TestRunningInstanceURLNoRedirect(t *testing.T) {
+	// 本机端口 302 到外部地址：client 不得跟随（否则就是一次 SSRF）。
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://169.254.169.254/latest/meta-data", http.StatusFound)
+	}))
+	defer redirector.Close()
+	if got := runningInstanceURL(portOf(t, redirector.URL), 1); got != "" {
+		t.Fatalf("redirect should not be followed, got %q", got)
+	}
+}
+
+func TestValidInstanceURL(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want bool
+	}{
+		{"http://127.0.0.1:6116", true},
+		{"http://localhost:6116", true},
+		{"http://[::1]:6116", true},
+		{"https://127.0.0.1:6116", true},
+		{"https://evil.example/steal", false},
+		{"ftp://127.0.0.1:6116", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if _, ok := validInstanceURL(c.raw); ok != c.want {
+			t.Errorf("validInstanceURL(%q) ok=%v, want %v", c.raw, ok, c.want)
+		}
+	}
+	// 控制字符不得进入返回值（防日志注入）。
+	for _, raw := range []string{
+		"http://127.0.0.1:6116\r\nInjected: 1",
+		"http://127.0.0.1:6116\x1b[31m",
+	} {
+		if clean, ok := validInstanceURL(raw); ok && strings.ContainsAny(clean, "\r\n\x1b") {
+			t.Fatalf("control chars survived in %q", clean)
+		}
 	}
 }

@@ -8,18 +8,15 @@
 #
 # 前置：1) 安装 Go   2) 安装 Xcode 命令行工具: xcode-select --install
 # 说明：菜单栏图标用 systray，在 macOS 走 cgo(Cocoa)，无法交叉编译，必须在 Mac 本机编译。
-# 用法：./build-mac.sh [version]（不传则默认 1.0.0）
+# 用法：./build-mac.sh [version]（不传则默认见 build-config.sh，也可设 LANOCLIP_VERSION）
 set -e
 cd "$(dirname "$0")"
 # 禁用 macOS cp 的 AppleDouble（._xxx）副文件，避免 .app 内混入垃圾
 export COPYFILE_DISABLE=1
 mkdir -p dist .build assets
 
-APP_NAME="LanCoClip"
-BUNDLE_ID="com.tuhu.lanoclip"
-VERSION="${1:-1.2.2}"
-# 构建时间（本机时区，即北京时间），注入 main.buildTime，设置弹窗里随版本号一起展示
-BUILD_TIME="$(date '+%Y-%m-%d %H:%M')"
+# 版本 / 命名 / 签名口令统一来自 build-config.sh，避免两个平台出包时不同步
+source ./build-config.sh "$1"
 # 稳定的自签名身份：辅助功能等 TCC 授权绑定在证书上，重新构建不再要求重新授权。
 # （ad-hoc 签名每次构建 CDHash 都变，macOS 会当成"新程序"要求重新授权）
 SIGN_IDENTITY="LanCoClip Dev"
@@ -78,20 +75,21 @@ ensure_signing_cert() {
       || return 1
     # macOS security 只认传统 PKCS#12 加密，必须 -legacy（或 SHA1/3DES 参数）
     openssl pkcs12 -export -legacy -out "${dir}/lanoclip.p12" \
-      -inkey "${dir}/lanoclip.key.pem" -in "${dir}/lanoclip.cert.pem" -passout pass:lanoclip-sign \
+      -inkey "${dir}/lanoclip.key.pem" -in "${dir}/lanoclip.cert.pem" -passout "pass:${LANOCLIP_SIGN_PASSWORD}" \
       || openssl pkcs12 -export -out "${dir}/lanoclip.p12" -inkey "${dir}/lanoclip.key.pem" \
-      -in "${dir}/lanoclip.cert.pem" -passout pass:lanoclip-sign \
+      -in "${dir}/lanoclip.cert.pem" -passout "pass:${LANOCLIP_SIGN_PASSWORD}" \
       -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 \
       || return 1
   fi
   security import "${dir}/lanoclip.p12" -k ~/Library/Keychains/login.keychain-db \
-    -P lanoclip-sign -T /usr/bin/codesign || return 1
+    -P "${LANOCLIP_SIGN_PASSWORD}" -T /usr/bin/codesign || return 1
   security add-trusted-cert -r trustRoot \
     -k ~/Library/Keychains/login.keychain-db "${dir}/lanoclip.cert.pem" || return 1
   security find-identity -v -p codesigning 2>/dev/null | grep -q "${SIGN_IDENTITY}" || {
     echo "!! 证书导入后仍不可用"; return 1
   }
   echo ">> 证书已导入并信任（有效期 10 年）"
+  echo "   注意：该证书已加入 login 钥匙串的信任根，仅用于本机签名；不需要时可在『钥匙串访问』里删除。"
   return 0
 }
 
@@ -219,3 +217,6 @@ echo ""
 echo "用法：双击 dist/${APP_NAME}.app —— 顶部菜单栏出现图标，点击（右键）可『打开页面』或『退出』。"
 echo "首次运行若被 Gatekeeper 拦截，先移除 quarantine："
 echo "  xattr -dr com.apple.quarantine dist/${APP_NAME}.app"
+echo ""
+echo "分发提示：本包用的是本机自签证书，未做 Apple 公证。拷到别的 Mac 会被 Gatekeeper 拦截；"
+echo "          公开分发需要 Apple Developer ID 签名 + notarization（本脚本不含该流程）。"

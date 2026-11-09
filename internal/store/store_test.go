@@ -1,11 +1,15 @@
 package store
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // newTestStore builds a Store backed by a throwaway directory.
@@ -306,8 +310,17 @@ func TestStoreSetLimitsTrimsOldestFirst(t *testing.T) {
 	if images[0].ID != before[0].ID || images[4].ID != before[4].ID {
 		t.Fatal("trim should keep the newest images")
 	}
+	// 新语义：SetLimits 只裁内存、不删文件——文件要等 Save 成功 +
+	// CommitTrim 之后才真正删除，避免「保存失败但数据已丢」。
+	if _, err := os.Stat(oldestImgPath); os.IsNotExist(err) {
+		t.Fatal("trimmed image file must survive until Save+CommitTrim")
+	}
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	s.CommitTrim()
 	if _, err := os.Stat(oldestImgPath); !os.IsNotExist(err) {
-		t.Fatal("trimmed image file should be deleted from disk")
+		t.Fatal("trimmed image file should be deleted after CommitTrim")
 	}
 
 	// 新上限立即对新增生效：再加 1 条文本就会挤掉最旧的
@@ -429,5 +442,578 @@ func TestEnvDirOverride(t *testing.T) {
 	}
 	if st.dir != iso {
 		t.Fatalf("NewStore dir = %q, want env dir %q", st.dir, iso)
+	}
+}
+
+// TestDiskUsage locks the water-mark helper: every file under the data
+// directory (images/, JSON, logs) must count toward the limit.
+func TestDiskUsage(t *testing.T) {
+	st := newTestStore(t)
+	if err := os.WriteFile(filepath.Join(st.dir, "blob.bin"), make([]byte, 4096), 0o644); err != nil {
+		t.Fatalf("write blob: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(st.imgDir, "nested.png"), make([]byte, 2048), 0o644); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+	used, err := st.DiskUsage()
+	if err != nil {
+		t.Fatalf("DiskUsage: %v", err)
+	}
+	if used < 4096+2048 {
+		t.Fatalf("DiskUsage = %d, want >= %d", used, 4096+2048)
+	}
+}
+
+// 暂停记录：不入库任何内容，且状态跨重启保持。
+func TestPaused(t *testing.T) {
+	st := newTestStore(t)
+	if st.Paused() {
+		t.Fatal("recording should be on by default")
+	}
+	if !st.AddText("first") {
+		t.Fatal("AddText failed before pause")
+	}
+	if err := st.SetPaused(true); err != nil {
+		t.Fatalf("SetPaused: %v", err)
+	}
+	if !st.Paused() {
+		t.Fatal("Paused() should be true")
+	}
+	if st.AddText("secret") {
+		t.Fatal("AddText must be ignored while paused")
+	}
+	if added, err := st.AddImage([]byte("image-bytes")); err != nil || added {
+		t.Fatalf("AddImage while paused = (%v, %v), want (false, nil)", added, err)
+	}
+	if err := st.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	st2, err := NewStore(st.dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if !st2.Paused() {
+		t.Fatal("paused state must survive a restart")
+	}
+	recs, total := st2.Page(KindText, 1, 10)
+	if total != 1 || len(recs) != 1 || recs[0].Content != "first" {
+		t.Fatalf("records after restart = %+v (total %d)", recs, total)
+	}
+	if err := st2.SetPaused(false); err != nil {
+		t.Fatalf("unpause: %v", err)
+	}
+	if !st2.AddText("second") {
+		t.Fatal("AddText should work again after resume")
+	}
+}
+
+// 损坏的 JSON 不能静默清空历史：先改名留证，再回退默认值。
+func TestCorruptJSONPreserved(t *testing.T) {
+	st := newTestStore(t)
+	st.AddText("hello")
+	if err := st.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := os.WriteFile(st.textsPath(), []byte("{broken"), 0o644); err != nil {
+		t.Fatalf("corrupt texts.json: %v", err)
+	}
+	st2, err := NewStore(st.dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if _, err := os.Stat(st.textsPath()); !os.IsNotExist(err) {
+		t.Fatalf("broken file should be moved away, stat err = %v", err)
+	}
+	backups, _ := filepath.Glob(st.textsPath() + ".corrupt-*")
+	if len(backups) != 1 {
+		t.Fatalf("expected one corrupt backup, got %v", backups)
+	}
+	data, err := os.ReadFile(backups[0])
+	if err != nil || string(data) != "{broken" {
+		t.Fatalf("backup content = %q, err = %v", data, err)
+	}
+	if _, total := st2.Page(KindText, 1, 10); total != 0 {
+		t.Fatalf("broken file should fall back to an empty store, total = %d", total)
+	}
+}
+
+// 启动回收无主图片；但元数据损坏时宁可留着，绝不误删用户图片。
+func TestCollectOrphanImages(t *testing.T) {
+	st := newTestStore(t)
+	if added, err := st.AddImage([]byte("image-1")); err != nil || !added {
+		t.Fatalf("AddImage = (%v, %v)", added, err)
+	}
+	if err := st.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	orphan := filepath.Join(st.imgDir, "99.png")
+	if err := os.WriteFile(orphan, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write orphan: %v", err)
+	}
+	// 用户手动放进目录的 PNG（不符合本程序命名规则）绝不能被回收。
+	manual := filepath.Join(st.imgDir, "my-notes.png")
+	if err := os.WriteFile(manual, []byte("keep"), 0o644); err != nil {
+		t.Fatalf("write manual png: %v", err)
+	}
+
+	st2, err := NewStore(st.dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("orphan should be removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(manual); err != nil {
+		t.Fatalf("manually placed png must be kept: %v", err)
+	}
+	path, ok := st2.ImagePath(1)
+	if !ok {
+		t.Fatal("referenced image record lost")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("referenced image should survive: %v", err)
+	}
+
+	// 元数据损坏时跳过回收
+	if err := os.WriteFile(st.imagesPath(), []byte("not json"), 0o644); err != nil {
+		t.Fatalf("corrupt images.json: %v", err)
+	}
+	if err := os.WriteFile(orphan, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write orphan again: %v", err)
+	}
+	if _, err := NewStore(st.dir); err != nil {
+		t.Fatalf("NewStore with broken metadata: %v", err)
+	}
+	if _, err := os.Stat(orphan); err != nil {
+		t.Fatalf("orphan must be kept when metadata is broken: %v", err)
+	}
+}
+
+// 写盘失败要能被页面看到，恢复成功后提示要消失。
+func TestSaveErrorVisible(t *testing.T) {
+	st := newTestStore(t)
+	st.AddText("x")
+	// texts.json 的目标路径变成目录 → rename 必定失败
+	if err := os.Mkdir(st.textsPath(), 0o755); err != nil {
+		t.Fatalf("mkdir blocker: %v", err)
+	}
+	if err := st.Save(); err == nil {
+		t.Fatal("Save should fail when target is a directory")
+	}
+	if st.SaveError() == "" {
+		t.Fatal("SaveError should be visible to the page")
+	}
+	if err := os.Remove(st.textsPath()); err != nil {
+		t.Fatalf("remove blocker: %v", err)
+	}
+	if err := st.Save(); err != nil {
+		t.Fatalf("Save after recovery: %v", err)
+	}
+	if st.SaveError() != "" {
+		t.Fatalf("SaveError should clear after a successful save, got %q", st.SaveError())
+	}
+}
+
+// AddImage 绝不覆盖同名文件（Clear 后写盘失败时旧 <id>.png 可能还在）。
+func TestAddImageNoOverwrite(t *testing.T) {
+	st := newTestStore(t)
+	existing := filepath.Join(st.imgDir, "1.png")
+	if err := os.WriteFile(existing, []byte("original"), 0o644); err != nil {
+		t.Fatalf("write existing: %v", err)
+	}
+	added, err := st.AddImage([]byte("new-image"))
+	if err != nil || !added {
+		t.Fatalf("AddImage = (%v, %v)", added, err)
+	}
+	data, err := os.ReadFile(existing)
+	if err != nil || string(data) != "original" {
+		t.Fatalf("existing file was overwritten: %q, err = %v", data, err)
+	}
+	path, ok := st.ImagePath(1)
+	if !ok {
+		t.Fatal("new record missing")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != "new-image" {
+		t.Fatalf("new image = %q, err = %v", got, err)
+	}
+}
+
+// TestPageHugePageNoPanic locks the overflow guard: a page near MaxInt used to
+// wrap (page-1)*size negative and panic on list[negative:negative].
+func TestPageHugePageNoPanic(t *testing.T) {
+	st := newTestStore(t)
+	for i := 0; i < 3; i++ {
+		st.AddText(fmt.Sprintf("record-%d", i))
+	}
+	huge := int(^uint(0) >> 1)
+	for _, p := range []int{huge, huge / 2, 1 << 40, 2, -1} {
+		got, total := st.Page(KindText, p, 10)
+		if total != 3 {
+			t.Fatalf("page %d: total = %d, want 3", p, total)
+		}
+		if p > 1 && len(got) != 0 {
+			t.Fatalf("page %d: got %d records, want 0", p, len(got))
+		}
+	}
+	if got, _ := st.Page(KindText, 1, 10); len(got) != 3 {
+		t.Fatalf("page 1 = %d records, want 3", len(got))
+	}
+}
+
+func TestDataFilePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows ACLs do not map to Unix mode bits")
+	}
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	st.AddText("secret")
+	if err := st.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	for _, p := range []string{dir, filepath.Join(dir, "images"), filepath.Join(dir, "texts.json")} {
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("stat %s: %v", p, err)
+		}
+		want := os.FileMode(0o600)
+		if info.IsDir() {
+			want = 0o700
+		}
+		if info.Mode().Perm() != want {
+			t.Errorf("%s mode = %v, want %v", p, info.Mode().Perm(), want)
+		}
+	}
+}
+
+func TestCleanStaleFiles(t *testing.T) {
+	dir := t.TempDir()
+	for i := 1; i <= 5; i++ {
+		name := fmt.Sprintf("texts.json.corrupt-%019d", i)
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("broken"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{"texts.json.tmp", "images.json.tmp"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("partial"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := NewStore(dir); err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var corrupt, tmp int
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".corrupt-") {
+			corrupt++
+		}
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			tmp++
+		}
+	}
+	if corrupt != 3 || tmp != 0 {
+		t.Fatalf("after cleanup: corrupt=%d (want 3), tmp=%d (want 0)", corrupt, tmp)
+	}
+}
+
+func TestRecentMixedMergesInOrder(t *testing.T) {
+	st := newTestStore(t)
+	st.mu.Lock()
+	st.texts = []Record{
+		{ID: 5, Kind: KindText, CreatedAt: 500},
+		{ID: 3, Kind: KindText, CreatedAt: 300},
+		{ID: 1, Kind: KindText, CreatedAt: 100},
+	}
+	st.images = []Record{
+		{ID: 4, Kind: KindImage, CreatedAt: 400},
+		{ID: 2, Kind: KindImage, CreatedAt: 200},
+	}
+	st.mu.Unlock()
+
+	got := st.RecentMixed(4)
+	want := []int64{5, 4, 3, 2}
+	if len(got) != len(want) {
+		t.Fatalf("RecentMixed(4) returned %d records, want %d", len(got), len(want))
+	}
+	for i, id := range want {
+		if got[i].ID != id {
+			t.Fatalf("RecentMixed(4)[%d].ID = %d, want %d", i, got[i].ID, id)
+		}
+	}
+	if len(st.RecentMixed(0)) != 0 || len(st.RecentMixed(99)) != 5 {
+		t.Fatal("RecentMixed boundary cases wrong")
+	}
+}
+
+// ── 审计回归：元数据损坏绝不能删用户图片 ──────────────────────────────
+
+func countPNGFiles(t *testing.T, dir string) int {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir(%s): %v", dir, err)
+	}
+	n := 0
+	for _, e := range entries {
+		if !e.IsDir() && filepath.Ext(e.Name()) == ".png" {
+			n++
+		}
+	}
+	return n
+}
+
+// settings.json 损坏时回退默认上限（图片 200），旧实现会立刻 trimList
+// 并真的 os.Remove 掉超出部分 —— 用户配过 1000 张就会静默丢 800 张。
+func TestBrokenSettingsKeepsImageFiles(t *testing.T) {
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	st.SetLimits(5000, 1000)
+	const imageCount = 300
+	for i := 0; i < imageCount; i++ {
+		if _, err := st.AddImage([]byte(fmt.Sprintf("png-%d", i))); err != nil {
+			t.Fatalf("AddImage(%d): %v", i, err)
+		}
+	}
+	if err := st.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if got := countPNGFiles(t, filepath.Join(dir, "images")); got != imageCount {
+		t.Fatalf("setup: %d png files, want %d", got, imageCount)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "settings.json"), []byte("{broken"), 0o600); err != nil {
+		t.Fatalf("break settings.json: %v", err)
+	}
+	st2, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore after corruption: %v", err)
+	}
+	if _, images := st2.Counts(); images != imageCount {
+		t.Fatalf("after broken settings: %d image records, want %d", images, imageCount)
+	}
+	if got := countPNGFiles(t, filepath.Join(dir, "images")); got != imageCount {
+		t.Fatalf("after broken settings: %d png files, want %d (files were deleted!)", got, imageCount)
+	}
+}
+
+// images.json 损坏后要从磁盘重建元数据；否则一次 Save 会把空列表写成
+// images.json，重启时 collectOrphanImages 把所有原图当孤儿删光。
+func TestBrokenImagesMetaIsRebuiltAndSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	imgDir := filepath.Join(dir, "images")
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := st.AddImage([]byte(fmt.Sprintf("img-%d", i))); err != nil {
+			t.Fatalf("AddImage(%d): %v", i, err)
+		}
+	}
+	if err := st.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "images.json"), []byte("{broken"), 0o600); err != nil {
+		t.Fatalf("break images.json: %v", err)
+	}
+
+	st2, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore after corruption: %v", err)
+	}
+	if _, images := st2.Counts(); images != 5 {
+		t.Fatalf("rebuilt records = %d, want 5", images)
+	}
+	if got := countPNGFiles(t, imgDir); got != 5 {
+		t.Fatalf("after rebuild: %d png files, want 5", got)
+	}
+
+	// 真实路径：本次会话不发生任何 AddText/AddImage/Clear（用户启动后只
+	// 看了看历史就退出，或直接系统重启），只有 3s ticker 的 Save 兜底。
+	// 重建必须把 images.json 写回磁盘，否则下次启动按「全新目录」把
+	// 磁盘图片当孤儿删光。
+	if err := st2.Save(); err != nil {
+		t.Fatalf("ticker Save after rebuild: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "images.json"))
+	if err != nil {
+		t.Fatalf("rebuilt images.json should be persisted: %v", err)
+	}
+	var persisted []Record
+	if err := json.Unmarshal(data, &persisted); err != nil || len(persisted) != 5 {
+		t.Fatalf("persisted images.json = %d records (err %v), want 5", len(persisted), err)
+	}
+
+	st3, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore third time: %v", err)
+	}
+	if _, images := st3.Counts(); images != 5 {
+		t.Fatalf("after restart: %d image records, want 5", images)
+	}
+	if got := countPNGFiles(t, imgDir); got != 5 {
+		t.Fatalf("after restart: %d png files, want 5 (orphan collector deleted them!)", got)
+	}
+}
+
+// images.json 被手工删除（而非损坏）但磁盘上还有图片时，同样必须从磁盘
+// 重建，绝不能当成「全新目录」把现有图片当孤儿回收。
+func TestMissingImagesJSONWithFilesOnDisk(t *testing.T) {
+	dir := t.TempDir()
+	imgDir := filepath.Join(dir, "images")
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := st.AddImage([]byte(fmt.Sprintf("img-%d", i))); err != nil {
+			t.Fatalf("AddImage(%d): %v", i, err)
+		}
+	}
+	if err := st.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := os.Remove(filepath.Join(dir, "images.json")); err != nil {
+		t.Fatalf("remove images.json: %v", err)
+	}
+
+	st2, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore after removal: %v", err)
+	}
+	if _, images := st2.Counts(); images != 3 {
+		t.Fatalf("rebuilt records = %d, want 3", images)
+	}
+	if got := countPNGFiles(t, imgDir); got != 3 {
+		t.Fatalf("png files = %d, want 3 (files were deleted!)", got)
+	}
+	if err := st2.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	st3, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if _, images := st3.Counts(); images != 3 {
+		t.Fatalf("after reopen: %d image records, want 3", images)
+	}
+}
+
+// SetLimits 的裁剪必须可回滚：Save 失败时 RestoreTrim 把被裁记录放回
+// 内存，落盘恢复后写回的仍是完整历史（对应服务端「保存失败却已删数据」）。
+func TestSetLimitsSaveFailureRestoresRecords(t *testing.T) {
+	st := newTestStore(t)
+	for i := 1; i <= 12; i++ {
+		st.AddText(fmt.Sprintf("t-%02d", i))
+	}
+	// texts.json.tmp 建成目录 → stageFile 必定失败
+	if err := os.Mkdir(st.textsPath()+".tmp", 0o755); err != nil {
+		t.Fatalf("mkdir blocker: %v", err)
+	}
+
+	trimmed, _ := st.SetLimits(10, 5)
+	if trimmed != 2 {
+		t.Fatalf("trimmed = %d, want 2", trimmed)
+	}
+	if err := st.Save(); err == nil {
+		t.Fatal("Save should fail with the blocker in place")
+	}
+	// 失败路径：回滚被裁记录
+	st.RestoreTrim()
+	if texts, _ := st.Counts(); texts != 12 {
+		t.Fatalf("after RestoreTrim: %d texts, want 12", texts)
+	}
+	// 顺序也必须保持 newest-first（RecentMixed 归并依赖）
+	page, _ := st.Page(KindText, 1, 12)
+	if page[0].Content != "t-12" || page[11].Content != "t-01" {
+		t.Fatalf("order broken after restore: %q … %q", page[0].Content, page[11].Content)
+	}
+
+	if err := os.Remove(st.textsPath() + ".tmp"); err != nil {
+		t.Fatalf("remove blocker: %v", err)
+	}
+	st.SetLimits(10, 5)
+	if err := st.Save(); err != nil {
+		t.Fatalf("Save after recovery: %v", err)
+	}
+	st.CommitTrim()
+	st2, err := NewStore(st.dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if texts, _ := st2.Counts(); texts != 10 {
+		t.Fatalf("after commit: %d texts, want 10", texts)
+	}
+}
+
+// 本机捕获的超长文本要截断到 512 KiB（与推送上限同源），避免 texts.json
+// 与页面响应被单条记录撑爆。
+func TestAddTextTruncatesHugePayload(t *testing.T) {
+	st := newTestStore(t)
+	big := strings.Repeat("a", maxTextPayloadBytes+100)
+	st.AddText(big)
+	page, total := st.Page(KindText, 1, 10)
+	if total != 1 || len(page) != 1 {
+		t.Fatalf("stored = %d, want 1", total)
+	}
+	if got := len(page[0].Content); got != maxTextPayloadBytes {
+		t.Fatalf("stored length = %d, want %d", got, maxTextPayloadBytes)
+	}
+	// 多字节边界不产生半个 rune
+	bigUTF := strings.Repeat("你好", (maxTextPayloadBytes/3)+50)
+	st.AddText(bigUTF)
+	page, _ = st.Page(KindText, 1, 10)
+	if !utf8.ValidString(page[0].Content) {
+		t.Fatal("truncated text must stay valid UTF-8")
+	}
+}
+
+// 极端兜底：元数据不可信且无法从磁盘重建时，Save 只能写 texts.json，
+// 绝不能用内存里的空列表覆盖 images.json。
+func TestSaveSkipsImagesWhenMetadataUntrusted(t *testing.T) {
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if _, err := st.AddImage([]byte("only-image")); err != nil {
+		t.Fatalf("AddImage: %v", err)
+	}
+	if err := st.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	path := filepath.Join(dir, "images.json")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	st.mu.Lock()
+	st.imagesMetaOK = false
+	st.mu.Unlock()
+	st.AddText("new text")
+	if err := st.Save(); err != nil {
+		t.Fatalf("Save with untrusted metadata: %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile after: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("images.json was overwritten while metadata is untrusted")
+	}
+	if _, images := st.Counts(); images != 1 {
+		t.Fatalf("in-memory image records = %d, want 1", images)
 	}
 }

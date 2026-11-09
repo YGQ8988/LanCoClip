@@ -5,6 +5,7 @@
 package histpop
 
 /*
+#cgo darwin CFLAGS: -fobjc-arc
 #cgo LDFLAGS: -framework Cocoa
 #include <stdlib.h>
 
@@ -31,8 +32,9 @@ type Group struct {
 }
 
 var (
-	mu     sync.Mutex
-	pickFn func(group, item int)
+	mu      sync.Mutex
+	pickFn  func(group, item int)
+	pickGen uint64 // 每次 Show 递增；defer 只清掉自己那一代的回调
 )
 
 // 每组条目 id 编码为 group*itemIDStep + item + 1，避免嵌套传递。
@@ -51,6 +53,7 @@ func histpopPicked(tag C.int) {
 	i := (id - 1) % itemIDStep
 	mu.Lock()
 	fn := pickFn
+	pickFn = nil // 取出即清空，避免菜单关闭后闭包被长期持有
 	mu.Unlock()
 	if fn != nil {
 		fn(g, i)
@@ -66,8 +69,19 @@ func Show(groups []Group, onPick func(group, item int)) bool {
 		return false
 	}
 	mu.Lock()
+	pickGen++
+	gen := pickGen
 	pickFn = onPick
 	mu.Unlock()
+	// 菜单 dismissed 后清掉回调（含未选中直接取消的情况）；pickGen 保证
+	// 不会误清掉并发 Show 刚设置的回调。
+	defer func() {
+		mu.Lock()
+		if pickGen == gen {
+			pickFn = nil
+		}
+		mu.Unlock()
+	}()
 
 	titles := make([]*C.char, len(groups))
 	for i, g := range groups {
@@ -92,7 +106,9 @@ func Show(groups []Group, onPick func(group, item int)) bool {
 	}
 	// C 侧不接受空指针：没有条目时给一个占位指针（不会被读取）
 	if len(labels) == 0 {
-		labels = append(labels, C.CString(""))
+		cs := C.CString("")
+		defer C.free(unsafe.Pointer(cs))
+		labels = append(labels, cs)
 	}
 
 	status := C.showHistoryMenu(&titles[0], &labels[0], &offsets[0], C.int(len(groups)))

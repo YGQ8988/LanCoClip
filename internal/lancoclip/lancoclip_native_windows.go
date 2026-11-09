@@ -13,6 +13,7 @@ import (
 	"log"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -49,6 +50,10 @@ var (
 
 	clipNotifyMu sync.Mutex
 	clipNotify   chan<- struct{}
+
+	// listenerTid 是消息循环线程的 ID；0 表示未运行/已退出。exit goroutine
+	// 只向非 0 的 tid 投递 WM_QUIT，避免误伤被复用的 OS 线程。
+	listenerTid atomic.Uint32
 )
 
 // nativeReadText reads the lancoclip text through Win32. handled=false means
@@ -202,10 +207,29 @@ func runLancoclipListener(ctx context.Context, ch chan<- struct{}) error {
 
 	// WM_QUIT is the only way to leave the blocking GetMessage loop, and it has
 	// to be posted to this thread from outside.
+	//
+	// 退出竞态：消息队列要等线程第一次调用 GetMessage 才创建，此前
+	// PostThreadMessageW 会失败；若只投递一次，wmQuit 丢失后线程永久阻塞。
+	// 因此循环重试（约 50ms 一次，最多 2s）。tid 为 0 说明循环已退出
+	// （或线程被解锁复用），立即停止投递。
 	tid, _, _ := procGetCurrentThreadID.Call()
+	listenerTid.Store(uint32(tid))
 	go func() {
 		<-ctx.Done()
-		procPostThreadMessageW.Call(tid, wmQuit, 0, 0)
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			if listenerTid.Load() == 0 {
+				return // 循环已经自己退出，无需（也不能）再投递
+			}
+			if r, _, _ := procPostThreadMessageW.Call(tid, wmQuit, 0, 0); r != 0 {
+				return
+			}
+			if time.Now().After(deadline) {
+				log.Printf("lancoclip listener: PostThreadMessage(wmQuit) failed for 2s, giving up")
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
 	}()
 
 	var m winMsg
@@ -213,6 +237,7 @@ func runLancoclipListener(ctx context.Context, ch chan<- struct{}) error {
 		// GetMessageW returns 0 for WM_QUIT and -1 on error.
 		r, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
 		if r == 0 || int32(r) == -1 {
+			listenerTid.Store(0)
 			return nil
 		}
 		procTranslateMessageW.Call(uintptr(unsafe.Pointer(&m)))

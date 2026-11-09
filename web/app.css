@@ -1,0 +1,364 @@
+  /* 亮色为默认，跟随系统切换到暗色（@media prefers-color-scheme） */
+  :root{
+    color-scheme:light dark;
+    --bg1:#eef2fb; --bg2:#e3e9f7; --bg3:#cfe0ff; --glow:#dbe7ff;
+    --glass:rgba(255,255,255,.62);
+    --glass-strong:rgba(255,255,255,.80);
+    --stroke:rgba(17,24,39,.10);
+    --text:#111a2e; --muted:#5a6684;
+    --primary:#3b82f6; --primary2:#2563eb;
+    --danger:#ef4444; --danger2:#dc2626;
+    --shadow:rgba(17,24,39,.14);
+    --overlay:rgba(17,24,39,.38);
+    --toast-bg:rgba(22,29,48,.92); --toast-text:#fff;
+    --radius:16px;
+    /* 毛玻璃背景光斑：亮色下用低饱和的蓝/紫/粉/青，
+       既给 backdrop-filter 提供可模糊的内容，又不会刺眼 */
+    --blob-a:rgba(147,197,253,.75);
+    --blob-b:rgba(196,181,253,.62);
+    --blob-c:rgba(249,208,232,.50);
+    --blob-d:rgba(153,246,228,.42);
+    /* 图片 tab 固定高度：PC 默认 200px（主流桌面 1920×1080、4 列布局）；
+       H5 在下方按 body.is-h5 覆盖为 240px（主流手机 390×844、单列满宽）。
+       JS 也读这个值，避免两处写死不一致 */
+    --shot-h:200px;
+  }
+  /* 暗色：由 <html data-theme="dark"> 驱动（head 内联脚本设置），
+     默认跟随系统、用户手动切换后按用户设置，不再直接跟随 prefers-color-scheme */
+  :root[data-theme="dark"]{
+    color-scheme:dark;
+    --bg1:#1b2440; --bg2:#0f1626; --bg3:#3a2a55; --glow:#22345e;
+    /* 暗色玻璃用「深墨蓝半透明」而不是「白色半透明」：
+       iOS Safari 对 backdrop-filter 的采样不稳定，白色半透明层在暗底上
+       常被渲染成发白的浅色块（表现为二维码/复制按钮「还是亮色」）。
+       用深色底无论模糊是否生效，按钮和卡片都是暗的 */
+    --glass:rgba(30,42,68,.62);
+    --glass-strong:rgba(44,59,92,.78);
+    --stroke:rgba(255,255,255,.18);
+    --text:#f2f5ff; --muted:#a9b3cf;
+    --shadow:rgba(0,0,0,.34);
+    --overlay:rgba(6,10,20,.62);
+    --toast-bg:rgba(20,26,44,.92); --toast-text:#fff;
+    /* 暗色下光斑换成低亮度霓虹色，玻璃上的文字依旧清晰 */
+    --blob-a:rgba(59,130,246,.26);
+    --blob-b:rgba(139,92,246,.24);
+    --blob-c:rgba(236,72,153,.18);
+    --blob-d:rgba(45,212,191,.16);
+  }
+  /* H5 单列满宽（列宽约 340px），图片固定高度比 PC 更高，窄屏也能看清内容 */
+  body.is-h5{ --shot-h:240px; }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  /* hidden 属性必须能压住 .btn 的 display，否则带 hidden 的按钮仍会显示 */
+  .btn[hidden]{display:none;}
+  /* html 定高、body 用 min-height：若 body 也 height:100%，内容溢出时
+     body 的 padding-bottom 不会被计入滚动高度，底部元素就会「吸」在窗口底边 */
+  html{margin:0;padding:0;height:100%;}
+  body{margin:0;padding:0;min-height:100%;}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    color:var(--text);
+    background:radial-gradient(1100px 700px at 10% -10%,var(--blob-a),transparent 62%),
+               radial-gradient(950px 650px at 95% 2%,var(--blob-b),transparent 58%),
+               radial-gradient(850px 650px at 80% 92%,var(--blob-c),transparent 60%),
+               radial-gradient(750px 560px at 6% 88%,var(--blob-d),transparent 62%),
+               linear-gradient(160deg,var(--bg1),var(--bg2));
+    background-attachment:fixed;
+    min-height:100%;
+    padding:calc(env(safe-area-inset-top) + 18px) 14px calc(env(safe-area-inset-bottom) + 34px);
+    -webkit-font-smoothing:antialiased;
+  }
+  /* 头部：图标 + 标题 + 介绍，整体居中 */
+  header{text-align:center;margin:2px 4px 12px;}
+  .hero-icon{width:76px;height:76px;display:block;margin:0 auto 10px;border-radius:20px;
+             box-shadow:0 10px 24px var(--shadow);}
+  header h1{font-size:20px;margin:0;letter-spacing:.5px;font-weight:600;}
+  /* 顶部介绍：不强制单行（窄屏会溢出屏幕），但宽度要够放下一整句——
+     这句约 512px，上限给 760px，桌面端正好一行居中，手机端自然折行 */
+  .hero-desc{font-size:12.5px;color:var(--muted);margin:7px auto 0;line-height:1.55;max-width:760px;}
+
+  /* 顶部 tab：文本 / 图片，位于访问地址卡片下方、与计数/清空同排 */
+  .tabs{
+    display:inline-flex;gap:4px;padding:4px;margin:0;
+    background:var(--glass);border:1px solid var(--stroke);border-radius:14px;
+    backdrop-filter:blur(18px) saturate(160%);-webkit-backdrop-filter:blur(18px) saturate(160%);
+    box-shadow:0 6px 20px var(--shadow);
+  }
+  .tab{
+    appearance:none;-webkit-appearance:none;border:none;background:transparent;color:var(--muted);
+    font-size:14px;font-weight:600;padding:7px 16px;border-radius:10px;cursor:pointer;
+    display:inline-flex;align-items:center;gap:6px;transition:background .15s ease,color .15s ease;
+  }
+  .tab:active{transform:scale(.97);}
+  .tab.active{background:linear-gradient(135deg,var(--primary),var(--primary2));color:#fff;}
+  .tab-badge{font-size:11px;font-weight:600;padding:1px 6px;border-radius:8px;min-width:18px;text-align:center;
+             background:var(--glass-strong);color:var(--muted);}
+  .tab-badge:empty{display:none;}
+  .tab.active .tab-badge{background:rgba(255,255,255,.24);color:#fff;}
+  /* 切换卡长度与访问地址卡片严格等宽（--feed-w 由 JS 测量 .share 写入），PC/H5 一致；
+     两个 tab 均分整条宽度呈分段控件式布局；tabs 是 toolbar 的 flex item，
+     窄窗口下 flex-shrink 自动收缩，不会撑爆工具栏 */
+  .tabs{width:var(--feed-w,auto);}
+  .tab{flex:1;justify-content:center;}
+  /* 主题切换：PC 上收回工具栏与设置并排；仅 H5 固定在页面右上角
+     （手机屏幕窄，fixed 不占工具栏空间），safe-area 适配刘海屏 */
+  body.is-h5 #themeBtn{
+    position:fixed;
+    top:calc(env(safe-area-inset-top) + 12px);
+    right:calc(env(safe-area-inset-right) + 12px);
+    z-index:50;
+  }
+
+  .card{
+    background:var(--glass);
+    backdrop-filter:blur(18px) saturate(160%);
+    -webkit-backdrop-filter:blur(18px) saturate(160%);
+    border:1px solid var(--stroke);
+    border-radius:var(--radius);
+    box-shadow:0 8px 30px var(--shadow);
+  }
+  /* 访问地址：卡片按内容宽度收缩并居中（不拉满页面），左右图标紧贴 URL */
+  .share{padding:10px 14px;margin:0 auto 10px;width:fit-content;max-width:100%;}
+  .share-row{display:flex;align-items:center;justify-content:center;gap:6px;}
+  .url{
+    flex:0 1 auto;min-width:0;text-align:center;font-size:15px;font-weight:600;letter-spacing:.3px;
+    overflow-wrap:anywhere;word-break:break-all;line-height:1.35;
+  }
+
+  .btn{
+    appearance:none;-webkit-appearance:none;border:1px solid var(--stroke);background:var(--glass-strong);color:var(--text);
+    font-size:14px;font-weight:600;padding:9px 14px;border-radius:12px;cursor:pointer;
+    display:inline-flex;align-items:center;gap:6px;transition:transform .08s ease,background .15s ease,opacity .15s ease;
+    backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);white-space:nowrap;
+  }
+  .btn:active{transform:scale(.96);}
+  .btn.icon{padding:9px;width:40px;justify-content:center;}
+  .btn.sm{padding:3px 9px;font-size:12px;border-radius:8px;font-weight:600;}
+  .btn svg{width:18px;height:18px;display:block;}
+  /* 主题切换图标：亮色显示太阳、暗色显示月亮。
+     选择器必须带上 .btn（特异性 0,2,0）才能压住上面的 .btn svg{display:block} */
+  .btn .icon-moon{display:none;}
+  :root[data-theme="dark"] .btn .icon-sun{display:none;}
+  :root[data-theme="dark"] .btn .icon-moon{display:block;}
+  .btn.primary{background:linear-gradient(135deg,var(--primary),var(--primary2));border-color:transparent;}
+  .btn.danger{background:linear-gradient(135deg,var(--danger),var(--danger2));border-color:transparent;}
+  .btn.block{width:100%;justify-content:center;padding:12px;font-size:15px;}
+  .btn.done{background:linear-gradient(135deg,#16a34a,#15803d);border-color:transparent;}
+
+  /* 左右两翼 flex:1 且 flex-basis:0，两侧等宽，tab 永远居中
+     （若用 1fr 栅格，左侧计数过宽会把中间挤偏） */
+  .toolbar{display:flex;align-items:center;gap:10px;margin:0 4px 8px;}
+  .tb-side{flex:1 1 0;min-width:0;display:flex;align-items:center;gap:10px;}
+  /* 右侧两个操作按钮（主题切换 / 设置）之间留出间距，避免挤在一起；
+     gap 只作用于实际渲染的子元素，按钮 hidden 时不会产生多余空隙 */
+  .tb-side.right{justify-content:flex-end;gap:12px;}
+  .toolbar .tabs{flex:0 0 auto;}
+  .toolbar .count{font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  /* 手机端隐藏计数：tab 角标已显示同样数字，去掉后 tab 严格居中 */
+  body.is-h5 .toolbar .count{display:none;}
+
+  /* 列表：PC 宽屏四列（每页 32 条 = 4 列 × 8 行），窄窗口与 H5 递减列数。
+     align-items:start 让每张卡保持自身高度，不被同行卡片拉伸 */
+  .list{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:1fr;gap:8px;align-items:start;}
+  .list.cols-4{grid-template-columns:1fr;}
+  @media (min-width:820px){
+    .list.cols-4{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;}
+  }
+  @media (min-width:1040px){
+    .list.cols-4{grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;}
+  }
+  /* 记录卡片：独立的毛玻璃小砖——半透明底 + 细描边 + 背景模糊。
+     放在彩色光斑背景上，玻璃质感才看得出来；圆角统一 14px，
+     图片 tab 的高度由 .shot 固定，不受卡片内边距影响 */
+  .item{padding:7px 11px 8px;display:flex;flex-direction:column;gap:5px;
+        background:var(--glass);border:1px solid var(--stroke);border-radius:14px;
+        box-shadow:0 6px 18px var(--shadow);
+        backdrop-filter:blur(16px) saturate(150%);
+        -webkit-backdrop-filter:blur(16px) saturate(150%);
+        animation:in .18s ease;}
+  @keyframes in{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:none;}}
+  /* 时间与「展开/复制」同排，整卡更矮，一屏能放更多条 */
+  .item-head{display:flex;align-items:center;gap:8px;min-height:22px;}
+  .time{font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;}
+  .content{
+    margin:0;font-size:13.5px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;
+    /* 剪贴板文本可含 Unicode bidi 控制符（U+202E 等），会把 URL/数字
+       视觉重排成另一个内容做钓鱼。plaintext 让每段按首个强方向字符
+       布局，浏览器不再把隐藏的 RTL 覆盖符应用于整行。 */
+    unicode-bidi:plaintext;
+  }
+  /* 默认只保留一行，超出一行由「展开」放开 */
+  .content.clamp{max-height:1.5em;overflow:hidden;}
+  .content.open{max-height:none;overflow:visible;}
+  /* 图片 tab：所有缩略图固定同一高度（PC/H5 不同），网格不再一高一低；
+     contain 保证任何比例的图片都完整可见，不裁切内容；
+     完整高度超出固定高度的图，由 JS 显示「展开」看全图 */
+  .shot{display:block;width:100%;height:var(--shot-h);object-fit:contain;object-position:center;
+        border-radius:8px;background:rgba(127,127,127,.14);}
+  /* 图片元素也带 content/clamp 类（与文本共用一套开关类），
+     必须压住 .content.clamp 的 1.5em 行高收起，否则图片会被切成一行高 */
+  .shot.clamp{max-height:none;overflow:visible;}
+  .shot.open{height:auto;object-fit:contain;}
+  a.btn{text-decoration:none;}
+  .toggle{background:none;border:none;color:var(--primary);font-size:12.5px;font-weight:600;cursor:pointer;padding:2px 4px;white-space:nowrap;}
+  .toggle[hidden]{display:none;}
+  .spacer{flex:1;}
+
+  .empty{text-align:center;color:var(--muted);font-size:14px;padding:48px 0;
+        background:var(--glass);border:1px solid var(--stroke);border-radius:14px;
+        backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);}
+  .empty[hidden]{display:none;}
+
+  /* H5：上滑加载更多 / 没有更多数据了 */
+  .loadmore{text-align:center;color:var(--muted);font-size:13px;padding:16px 0 8px;}
+  .loadmore[hidden]{display:none;}
+
+  /* PC：分页器（与列表留出呼吸感，不再贴住窗口底边） */
+  .pager{display:flex;align-items:center;justify-content:center;gap:6px;flex-wrap:wrap;
+         margin:22px 0 10px;padding-top:14px;border-top:1px solid var(--stroke);}
+  .pager[hidden]{display:none;}
+  .pager .pages{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
+  .pager .page{min-width:34px;justify-content:center;}
+  .pager .page.active{background:linear-gradient(135deg,var(--primary),var(--primary2));border-color:transparent;color:#fff;}
+  .pager .ellipsis{color:var(--muted);font-size:13px;padding:0 2px;}
+  .pager .btn[disabled]{opacity:.4;cursor:not-allowed;}
+
+  .modal{
+    position:fixed;inset:0;background:var(--overlay);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
+    display:flex;align-items:center;justify-content:center;padding:22px;z-index:50;animation:fade .18s ease;
+  }
+  @keyframes fade{from{opacity:0;}to{opacity:1;}}
+  .modal[hidden]{display:none;}
+  .modal-card{
+    position:relative;width:100%;max-width:340px;text-align:center;
+    background:var(--glass-strong);border:1px solid var(--stroke);border-radius:20px;
+    padding:26px 20px 20px;box-shadow:0 24px 60px var(--shadow);
+    backdrop-filter:blur(20px) saturate(160%);-webkit-backdrop-filter:blur(20px) saturate(160%);
+  }
+  .modal-card h2{font-size:16px;margin:0 0 16px;font-weight:600;}
+  /* 设置标题旁的版本徽标：版本号 + 构建时间 */
+  .settings-ver{
+    display:inline-block;vertical-align:2px;margin-left:8px;
+    font-size:11px;font-weight:500;line-height:1;
+    padding:4px 8px;border-radius:99px;
+    color:var(--muted);background:var(--glass-strong);
+    border:1px solid var(--stroke);
+  }
+  .modal-close{
+    position:absolute;top:12px;right:12px;width:34px;height:34px;border-radius:50%;
+    border:1px solid var(--stroke);background:var(--glass-strong);color:var(--text);
+    font-size:20px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;
+  }
+  .modal-card img{width:210px;height:210px;border-radius:14px;background:#fff;padding:10px;display:block;margin:0 auto;}
+  .modal-url{font-size:13px;color:var(--muted);margin:14px 0 16px;overflow-wrap:anywhere;word-break:break-all;}
+
+  /* 设置弹窗：左对齐表单 */
+  .settings-card{text-align:left;max-width:360px;}
+  .field{display:block;margin:0 0 14px;}
+  .field-label{display:block;font-size:13px;font-weight:600;color:var(--muted);margin:0 0 6px;}
+  .field input{
+    width:100%;padding:10px 12px;font-size:15px;font-weight:600;color:var(--text);
+    background:var(--glass);border:1px solid var(--stroke);border-radius:12px;outline:none;
+    font-variant-numeric:tabular-nums;
+  }
+  .field input:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(59,130,246,.20);}
+  .field-hint{font-size:12px;color:var(--muted);line-height:1.5;margin:0 0 18px;}
+  .modal-actions{display:flex;gap:10px;}
+  /* 顶部状态横幅：暂停记录 / 写盘异常，轮询时自动同步 */
+  .notice{margin:0 auto 12px;padding:10px 14px;border-radius:12px;font-size:13px;font-weight:600;
+          background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.38);color:var(--text);}
+  .notice[hidden]{display:none;}
+
+  /* 设置弹窗内的 tab（通用 / 快捷键） */
+  .set-tabs{display:flex;gap:4px;padding:4px;margin:0 0 16px;background:var(--glass);
+            border:1px solid var(--stroke);border-radius:12px;}
+  .set-tab{flex:1;appearance:none;-webkit-appearance:none;border:none;background:transparent;
+           color:var(--muted);font-size:13.5px;font-weight:600;padding:7px 0;border-radius:9px;
+           cursor:pointer;transition:background .15s ease,color .15s ease;}
+  .set-tab.active{background:linear-gradient(135deg,var(--primary),var(--primary2));color:#fff;}
+  /* 开机自启：iOS 风格开关 */
+  .switch-field{display:flex;align-items:center;justify-content:space-between;gap:10px;
+                padding:2px 0 12px;border-bottom:1px solid var(--stroke);margin:0 0 14px;}
+  .switch-field .field-label{margin:0;}
+  .switch-wrap{display:inline-flex;align-items:center;gap:9px;cursor:pointer;position:relative;}
+  .switch-wrap input{position:absolute;opacity:0;width:0;height:0;}
+  .switch-ui{width:42px;height:25px;border-radius:13px;background:var(--glass-strong);
+             border:1px solid var(--stroke);position:relative;transition:background .18s ease;flex:0 0 auto;display:block;}
+  .switch-ui::after{content:'';position:absolute;top:2px;left:2px;width:19px;height:19px;border-radius:50%;
+                    background:var(--text);opacity:.85;transition:transform .18s ease,background .18s ease;}
+  .switch-wrap input:checked + .switch-ui{background:linear-gradient(135deg,var(--primary),var(--primary2));}
+  .switch-wrap input:checked + .switch-ui::after{transform:translateX(17px);background:#fff;opacity:1;}
+  .switch-wrap input:focus-visible + .switch-ui{box-shadow:0 0 0 3px rgba(59,130,246,.25);}
+  .switch-text{font-size:12px;color:var(--muted);}
+  /* 快捷键展示行：右侧是可点击的「按键捕获」框 */
+  .hk-row{display:flex;align-items:center;justify-content:space-between;gap:10px;
+          padding:10px 2px;border-bottom:1px solid var(--stroke);}
+  .hk-row:last-of-type{margin-bottom:14px;}
+  .hk-name{font-size:13.5px;font-weight:600;color:var(--text);}
+  kbd{font-family:inherit;font-size:12.5px;font-weight:600;color:var(--text);
+      background:var(--glass-strong);border:1px solid var(--stroke);border-radius:8px;
+      padding:4px 9px;box-shadow:0 2px 5px var(--shadow);}
+  .hk-capture{appearance:none;-webkit-appearance:none;border:1px dashed var(--stroke);
+      background:var(--glass);border-radius:10px;padding:5px 10px;cursor:pointer;
+      color:var(--text);transition:border-color .15s,box-shadow .15s;}
+  .hk-capture:hover{border-color:var(--primary);}
+  .hk-capture.listening{border-style:solid;border-color:var(--primary);
+      box-shadow:0 0 0 3px rgba(59,130,246,.25);animation:hkPulse 1.2s ease-in-out infinite;}
+  @keyframes hkPulse{0%,100%{opacity:1}50%{opacity:.6}}
+  .hk-capture[hidden]{display:none;}
+  /* 历史记录浮层 */
+  .history-card{max-width:420px;}
+  .hist-sub{font-size:11.5px;font-weight:500;color:var(--muted);margin-left:6px;}
+  .hist-list{list-style:none;margin:0;padding:0;max-height:min(60vh,420px);overflow-y:auto;
+             display:flex;flex-direction:column;gap:6px;}
+  .hist-item{display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:11px;
+             background:var(--glass);border:1px solid var(--stroke);cursor:pointer;
+             font-size:13px;color:var(--text);text-align:left;transition:background .15s ease,transform .08s ease;}
+  .hist-item:hover{background:var(--glass-strong);}
+  .hist-item:active{transform:scale(.985);}
+  .hist-time{font-size:11px;color:var(--muted);flex:0 0 auto;font-variant-numeric:tabular-nums;}
+  .hist-text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;unicode-bidi:plaintext;}
+  .hist-thumb{width:34px;height:34px;border-radius:8px;object-fit:cover;background:#fff;flex:0 0 auto;}
+
+  /* 手机端悬浮「添加」按钮：文本 tab = 写一条文本，图片 tab = 从相册/文件选图上传。
+     图标按 tab 切换（与主题按钮同一套路：两个 svg 二选一显示） */
+  .fab{
+    position:fixed;z-index:45;
+    right:calc(env(safe-area-inset-right) + 16px);
+    bottom:calc(env(safe-area-inset-bottom) + 24px);
+    width:54px;height:54px;border-radius:50%;
+    appearance:none;-webkit-appearance:none;
+    border:1px solid var(--stroke);
+    background:linear-gradient(135deg,var(--primary),var(--primary2));
+    color:#fff;display:flex;align-items:center;justify-content:center;
+    box-shadow:0 10px 26px var(--shadow);cursor:pointer;
+    transition:transform .08s ease;
+  }
+  .fab[hidden]{display:none;}
+  .fab:active{transform:scale(.94);}
+  /* 可拖动（挡住内容时挪开）：按住直接拖，位置记在 localStorage。
+     touch-action:none 必须加，否则手机上拖它会被当成页面滚动 */
+  .fab{cursor:grab;touch-action:none;-webkit-user-select:none;user-select:none;}
+  .fab.dragging{cursor:grabbing;transform:scale(1.06);transition:none;box-shadow:0 14px 34px var(--shadow);}
+  .fab svg{width:26px;height:26px;display:block;}
+  .fab .icon-image{display:none;}
+  .fab.pick-image .icon-text{display:none;}
+  .fab.pick-image .icon-image{display:block;}
+  /* 添加文本弹窗：右上角 × 关闭，底部「取消 / 添加」并排（取消在左） */
+  .add-card{text-align:left;max-width:360px;padding:22px 18px 18px;}
+  /* 标题右侧留出 × 的位置，避免长标题被压在关闭按钮下面 */
+  .add-card h2{font-size:15px;margin:0 44px 12px 0;}
+  .add-input{
+    width:100%;resize:vertical;font-family:inherit;font-size:15px;line-height:1.5;
+    color:var(--text);background:var(--glass);border:1px solid var(--stroke);
+    border-radius:12px;padding:10px 12px;outline:none;
+  }
+  .add-input:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(59,130,246,.20);}
+  .add-card .modal-actions{margin-top:12px;}
+
+  .toast{
+    position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom) + 30px);transform:translate(-50%,20px);
+    background:var(--toast-bg);border:1px solid var(--stroke);color:var(--toast-text);font-size:14px;font-weight:500;
+    padding:11px 18px;border-radius:12px;opacity:0;pointer-events:none;transition:.22s ease;z-index:60;
+    backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  }
+  .toast.show{opacity:1;transform:translate(-50%,0);}

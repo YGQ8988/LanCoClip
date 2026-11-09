@@ -38,8 +38,10 @@ static LCPNotificationDelegate *gDelegate = nil;
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
  didReceiveNotificationResponse:(UNNotificationResponse *)response
           withCompletionHandler:(void (^)(void))completionHandler {
-    goNotifyClicked();
-    completionHandler();
+    @autoreleasepool {
+        goNotifyClicked();
+        completionHandler();
+    }
 }
 
 @end
@@ -74,26 +76,32 @@ int lcpNotify(const char *title, const char *body) {
         UNAuthorizationOptions opts = UNAuthorizationOptionAlert | UNAuthorizationOptionSound;
         [center requestAuthorizationWithOptions:opts
                               completionHandler:^(BOOL granted, NSError *error) {
-            if (!granted) {
-                NSLog(@"LanCoClip: notification permission denied (%@)", error);
-                return;
-            }
-            UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
-            content.title = t;
-            content.body = b;
-            content.sound = [UNNotificationSound defaultSound];
-
-            // trigger:nil 表示立即投递
-            UNNotificationRequest *req =
-                [UNNotificationRequest requestWithIdentifier:@"lanoclip-ready"
-                                                     content:content
-                                                     trigger:nil];
-            [center addNotificationRequest:req
-                     withCompletionHandler:^(NSError *e) {
-                if (e) {
-                    NSLog(@"LanCoClip: add notification failed: %@", e);
+            // 异步回调跑在框架的自有线程/队列上，显式 pool 回收临时对象
+            //（即使 ARC 也建议）。
+            @autoreleasepool {
+                if (!granted) {
+                    NSLog(@"LanCoClip: notification permission denied (%@)", error);
+                    return;
                 }
-            }];
+                UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+                content.title = t;
+                content.body = b;
+                content.sound = [UNNotificationSound defaultSound];
+
+                // trigger:nil 表示立即投递
+                UNNotificationRequest *req =
+                    [UNNotificationRequest requestWithIdentifier:@"lanoclip-ready"
+                                                         content:content
+                                                         trigger:nil];
+                [center addNotificationRequest:req
+                         withCompletionHandler:^(NSError *e) {
+                    @autoreleasepool {
+                        if (e) {
+                            NSLog(@"LanCoClip: add notification failed: %@", e);
+                        }
+                    }
+                }];
+            }
         }];
     }
     return 0;

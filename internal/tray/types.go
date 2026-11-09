@@ -24,6 +24,10 @@ type App interface {
 	CopyItem(it Item) error
 	// ClearAll drops every text and image record.
 	ClearAll() error
+	// Paused reports whether new clipboard content is being ignored.
+	Paused() bool
+	// SetPaused toggles recording; an error means the choice could not be saved.
+	SetPaused(on bool) error
 }
 
 // logf is a tiny indirection so types.go stays import-light.

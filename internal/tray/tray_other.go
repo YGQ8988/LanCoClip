@@ -16,3 +16,6 @@ func UpdateHistory(items []Item) {}
 
 // Quit is a no-op on platforms without a native tray.
 func Quit() {}
+
+// stopPlatformLoops has nothing to stop when there is no native tray.
+func stopPlatformLoops() {}

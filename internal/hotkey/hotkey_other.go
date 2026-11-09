@@ -1,4 +1,4 @@
-//go:build !darwin && !windows
+//go:build !((darwin && cgo) || windows)
 
 // Package hotkey: no global hotkeys on platforms without a tray GUI.
 package hotkey

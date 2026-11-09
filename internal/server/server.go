@@ -8,9 +8,11 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"lanoclip/internal/lanaddr"
@@ -47,6 +49,21 @@ type Server struct {
 
 	netMu      sync.Mutex
 	netChecked time.Time // when localIPs/shareURL were last recomputed
+
+	// settingsMu 串行化 /api/settings 的 POST 事务：并发提交时若两条请求
+	// 都读到同一份旧值，后失败的一方回滚会把先成功一方已生效的设置抹掉。
+	settingsMu sync.Mutex
+
+	limiterOnce sync.Once
+	limiter     *writeLimiter // 写请求限流，惰性初始化以兼容测试里直构的 Server
+	diskBudget  atomic.Int64  // 仅测试注入；<=0 时用 store.MaxDataDirBytes
+	uploadMu    sync.Mutex    // 串行化图片上传，保证磁盘水位检查看到真实占用
+}
+
+// writeLimiter returns the shared limiter, creating it on first route build.
+func (s *Server) writeLimiter() *writeLimiter {
+	s.limiterOnce.Do(func() { s.limiter = newWriteLimiter() })
+	return s.limiter
 }
 
 // New builds a Server. webFS is the embedded web directory (embed cannot reach
@@ -68,8 +85,11 @@ func (s *Server) Suppressor() *lancoclip.Suppressor { return s.suppressor }
 // SetBoundPort records the port actually bound (after port fallback) and
 // rebuilds the share URL from the current best LAN address.
 func (s *Server) SetBoundPort(port int) {
+	s.netMu.Lock()
+	defer s.netMu.Unlock()
 	s.port = port
-	s.shareURL = fmt.Sprintf("http://%s:%d", lanaddr.BestLocalIP(), port)
+	// BestLocalHost 会为 IPv6-only 的机器返回带方括号的地址，直接拼进 URL 即可。
+	s.shareURL = fmt.Sprintf("http://%s:%d", lanaddr.BestLocalHost(), port)
 	s.netChecked = time.Now() // this probe counts as one refresh
 }
 
@@ -85,18 +105,20 @@ const netTTL = 3 * time.Second
 // at an IP that no longer exists and canClear fails for the new local IP.
 // It is a no-op for test-built servers (port == 0 keeps preset values).
 func (s *Server) refreshNet() {
+	s.netMu.Lock()
+	defer s.netMu.Unlock()
+	// port 也在锁内读：SetBoundPort 会同时改 port 与 shareURL，锁外读会与
+	// 绑定端口的写入产生数据竞争。
 	if s.port == 0 {
 		return
 	}
-	s.netMu.Lock()
-	defer s.netMu.Unlock()
 	if !s.netChecked.IsZero() && time.Since(s.netChecked) < netTTL {
 		return
 	}
 	s.netChecked = time.Now()
 	s.localIPs = lanaddr.LocalIPSet()
-	if ip := lanaddr.BestLocalIP(); ip != "" {
-		s.shareURL = fmt.Sprintf("http://%s:%d", ip, s.port)
+	if host := lanaddr.BestLocalHost(); host != "" {
+		s.shareURL = fmt.Sprintf("http://%s:%d", host, s.port)
 	}
 }
 
@@ -120,7 +142,12 @@ func (s *Server) LocalURL() string { return s.localURL() }
 // localURL is the page address on this machine itself. Unlike URL() it does not
 // depend on the LAN address, so it keeps working with no network at all — which
 // is exactly the case for "you already have this running, here is its page".
-func (s *Server) localURL() string { return fmt.Sprintf("http://127.0.0.1:%d", s.port) }
+// port is read under netMu because SetBoundPort writes it there.
+func (s *Server) localURL() string {
+	s.netMu.Lock()
+	defer s.netMu.Unlock()
+	return fmt.Sprintf("http://127.0.0.1:%d", s.port)
+}
 
 // Recent implements tray.App: the newest records across both kinds, formatted
 // for the tray menu.
@@ -166,6 +193,11 @@ func (s *Server) ClearAll() error {
 	log.Println("cleared all history from the tray")
 	return nil
 }
+
+// Paused / SetPaused implement tray.App: the tray menu exposes a toggle so
+// sensitive copies (passwords, OTPs) can be excluded without quitting the app.
+func (s *Server) Paused() bool            { return s.store.Paused() }
+func (s *Server) SetPaused(on bool) error { return s.store.SetPaused(on) }
 
 // TrayItemLabel formats one record as a tray menu title:
 // "14:05 会议纪要要点…" / "01-02 14:05 [图片]".
@@ -217,34 +249,112 @@ func RunningInstanceURL(start, tries int) (string, bool) {
 // start. Each attempt is short-lived — a closed port fails instantly, and the
 // only real cost is the HTTP timeout on a port that is open but slow.
 func runningInstanceURL(start, tries int) string {
-	client := &http.Client{Timeout: 300 * time.Millisecond}
-	for i := 0; i < tries; i++ {
-		port := start + i
-		req, err := http.NewRequest(http.MethodPost,
-			fmt.Sprintf("http://127.0.0.1:%d/api/activate", port), strings.NewReader("{}"))
-		if err != nil {
-			continue
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := client.Do(req)
-		if err != nil {
-			continue
-		}
-		var body struct {
-			App string `json:"app"`
-			URL string `json:"url"`
-		}
-		_ = json.NewDecoder(io.LimitReader(resp.Body, 1<<12)).Decode(&body)
-		resp.Body.Close()
-		if body.App != "lanoclip" {
-			continue
-		}
-		if body.URL != "" {
-			return body.URL
-		}
-		return fmt.Sprintf("http://127.0.0.1:%d", port)
+	// 禁跟随重定向：本机端口上若是个会 302 到外部地址的服务，跟随它就等于
+	// 用一次「启动探测」打出一发 SSRF。ErrUseLastResponse 让 client.Do 直接
+	// 交回 3xx 本身，probeInstance 再按内容判定。
+	client := &http.Client{
+		Timeout: 300 * time.Millisecond,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
-	return ""
+	type hit struct {
+		port int
+		url  string
+	}
+	// 端口之间互不依赖，并发探测把最坏启动延迟从 10×300ms 降到一次超时。
+	hits := make(chan hit, tries)
+	var wg sync.WaitGroup
+	for i := 0; i < tries; i++ {
+		wg.Add(1)
+		go func(port int) {
+			defer wg.Done()
+			if u := probeInstance(client, port); u != "" {
+				hits <- hit{port: port, url: u}
+			}
+		}(start + i)
+	}
+	wg.Wait()
+	close(hits)
+
+	// 多个命中时取端口最小的那个，即最早启动、最可能是主实例的一个。
+	best := hit{port: int(^uint(0) >> 1)}
+	for h := range hits {
+		if h.port < best.port {
+			best = h
+		}
+	}
+	return best.url
+}
+
+// probeInstance asks one port to identify itself. A foreign service must not
+// be mistaken for LanCoClip, otherwise every launch would refuse to start.
+func probeInstance(client *http.Client, port int) string {
+	req, err := http.NewRequest(http.MethodPost,
+		fmt.Sprintf("http://127.0.0.1:%d/api/activate", port), strings.NewReader("{}"))
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var body struct {
+		App string `json:"app"`
+		URL string `json:"url"`
+	}
+	_ = json.NewDecoder(io.LimitReader(resp.Body, 1<<12)).Decode(&body)
+	if body.App != "lanoclip" {
+		return ""
+	}
+	if body.URL != "" {
+		// 探测响应里的 URL 必须指向本机：否则把被投毒的地址带回启动流程 /
+		// 日志就是 SSRF / 日志注入。非法值直接当成「没探到实例」。
+		if clean, ok := validInstanceURL(body.URL); ok {
+			return clean
+		}
+		return ""
+	}
+	return fmt.Sprintf("http://127.0.0.1:%d", port)
+}
+
+// validInstanceURL 校验单实例探测响应里的 URL：scheme 只接受 http/https，
+// Host 必须是 loopback（127.0.0.1 / localhost / ::1）或本机网卡地址。控制字符
+// 被剔除，避免注入日志或终端转义序列。通过返回清理后的 URL，失败返回 ("", false)。
+func validInstanceURL(raw string) (string, bool) {
+	clean := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, raw)
+	u, err := url.Parse(clean)
+	if err != nil {
+		return "", false
+	}
+	if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
+		return "", false
+	}
+	host := u.Hostname()
+	if host == "" {
+		return "", false
+	}
+	if isLocalInstanceHost(host) {
+		return clean, true
+	}
+	return "", false
+}
+
+func isLocalInstanceHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return lanaddr.LocalIPSet()[host]
 }
 
 // ListenFirstFree binds the first free TCP port in [start, start+tries).

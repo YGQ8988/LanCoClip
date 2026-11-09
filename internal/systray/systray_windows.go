@@ -966,13 +966,25 @@ func SetNotifyClickHandler(fn func()) {
 	notifyClickMu.Unlock()
 }
 
+// fireNotifyClick consumes the handler: a balloon click fires the callback at
+// most once. Leaving it registered made a later, unrelated balloon click run
+// a stale action (or invoke a handler whose target had already gone away).
 func fireNotifyClick() {
-	notifyClickMu.RLock()
+	notifyClickMu.Lock()
 	fn := notifyClickFn
-	notifyClickMu.RUnlock()
+	notifyClickFn = nil
+	notifyClickMu.Unlock()
 	if fn != nil {
 		go fn()
 	}
+}
+
+// clearNotifyClick drops a handler whose balloon was never shown, so it cannot
+// fire against a later balloon.
+func clearNotifyClick() {
+	notifyClickMu.Lock()
+	notifyClickFn = nil
+	notifyClickMu.Unlock()
 }
 
 // Notify shows a balloon notification attached to the tray icon. Windows 10/11
@@ -985,16 +997,19 @@ func Notify(title, body string) error {
 	)
 	t, err := windows.UTF16FromString(title)
 	if err != nil {
+		clearNotifyClick()
 		return err
 	}
 	b, err := windows.UTF16FromString(body)
 	if err != nil {
+		clearNotifyClick()
 		return err
 	}
 
 	wt.muNID.Lock()
-	defer wt.muNID.Unlock()
 	if wt.nid == nil {
+		wt.muNID.Unlock()
+		clearNotifyClick()
 		return fmt.Errorf("systray: tray icon not created yet")
 	}
 	copy(wt.nid.InfoTitle[:], t[:min(len(t), len(wt.nid.InfoTitle))])
@@ -1004,7 +1019,15 @@ func Notify(title, body string) error {
 	wt.nid.Timeout = 10
 	wt.nid.Flags |= NIF_INFO
 	wt.nid.Size = uint32(unsafe.Sizeof(*wt.nid))
-	return wt.nid.modify()
+	err = wt.nid.modify()
+	wt.muNID.Unlock()
+	if err != nil {
+		// Shell_NotifyIcon 返回 FALSE：气泡没弹出来，点击回调永远不会触发，
+		// 清掉它，避免残留到下一颗气泡。
+		clearNotifyClick()
+		return err
+	}
+	return nil
 }
 
 func addOrUpdateMenuItem(item *MenuItem) {

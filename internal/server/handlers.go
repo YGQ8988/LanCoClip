@@ -14,6 +14,11 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -50,6 +55,10 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 const (
 	defaultPageSize = 10
 	maxPageSize     = 500
+	// page 没有业务理由超过这个值；夹住它也能防止 page*size 溢出。
+	maxPage = 1 << 20
+	// QR 容量有限，正常 URL 远小于此；挡住超长 text 造成的无意义编码开销。
+	maxQRTextBytes = 1024
 )
 
 // handleFavicon serves the browser-tab icon. /favicon.ico is handled too
@@ -77,9 +86,39 @@ func (s *Server) serveWebPNG(w http.ResponseWriter, r *http.Request, name string
 	_, _ = w.Write(data)
 }
 
+// Static page assets (CSS / JS) split out of index.html so the CSP can drop
+// 'unsafe-inline'. They are read from the same embedded FS as the page.
+func (s *Server) handleAppJS(w http.ResponseWriter, r *http.Request) {
+	s.serveWebAsset(w, r, "web/app.js", "application/javascript; charset=utf-8")
+}
+
+func (s *Server) handleThemeJS(w http.ResponseWriter, r *http.Request) {
+	s.serveWebAsset(w, r, "web/theme.js", "application/javascript; charset=utf-8")
+}
+
+func (s *Server) handleAppCSS(w http.ResponseWriter, r *http.Request) {
+	s.serveWebAsset(w, r, "web/app.css", "text/css; charset=utf-8")
+}
+
+// serveWebAsset writes one embedded text asset with caching disabled, so a
+// rebuilt binary never serves stale JS/CSS from the browser cache.
+func (s *Server) serveWebAsset(w http.ResponseWriter, r *http.Request, name, contentType string) {
+	data, err := fs.ReadFile(s.webFS, name)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(data)
+}
+
 func (s *Server) handleRecords(w http.ResponseWriter, r *http.Request) {
 	kind := parseKind(r.URL.Query().Get("type"))
 	page := queryInt(r, "page", 1)
+	if page > maxPage {
+		page = maxPage
+	}
 	size := queryInt(r, "size", defaultPageSize)
 	if size > maxPageSize {
 		size = maxPageSize
@@ -94,19 +133,21 @@ func (s *Server) handleRecords(w http.ResponseWriter, r *http.Request) {
 	textCount, imageCount := s.store.Counts()
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"records":    records,
-		"type":       kind,
-		"page":       page,
-		"size":       size,
-		"total":      total,
-		"totalPages": totalPages,
-		"hasMore":    page*size < total,
-		"counts":     map[string]int{"text": textCount, "image": imageCount},
-		"settings":   map[string]int{"maxText": s.store.MaxText(), "maxImage": s.store.MaxImage()},
-		"canClear":   s.canClear(r),
-		"shareUrl":   s.currentShareURL(),
-		"version":    Version,
-		"buildTime":  BuildTime,
+		"records":      records,
+		"type":         kind,
+		"page":         page,
+		"size":         size,
+		"total":        total,
+		"totalPages":   totalPages,
+		"hasMore":      page*size < total,
+		"counts":       map[string]int{"text": textCount, "image": imageCount},
+		"settings":     map[string]int{"maxText": s.store.MaxText(), "maxImage": s.store.MaxImage()},
+		"canClear":     s.canClear(r),
+		"shareUrl":     s.currentShareURL(),
+		"version":      Version,
+		"buildTime":    BuildTime,
+		"paused":       s.store.Paused(),
+		"storageError": s.store.SaveError(),
 	})
 }
 
@@ -173,7 +214,11 @@ func (s *Server) handleClear(w http.ResponseWriter, r *http.Request) {
 		kind = ""
 	}
 	s.store.Clear(kind)
-	_ = s.store.Save()
+	if err := s.store.Save(); err != nil {
+		log.Printf("save after clear: %v", err)
+		writeStorageError(w)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "type": kind})
 }
 
@@ -191,10 +236,17 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			"autostartSupported": autostart.Supported(),
 			"hotkeyQR":           s.store.HotkeyQR(),
 			"hotkeyHistory":      s.store.HotkeyHistory(),
+			"paused":             s.store.Paused(),
+			"storageError":       s.store.SaveError(),
 		}
 		writeJSON(w, http.StatusOK, resp)
 		return
 	case http.MethodPost:
+		// 整个 POST 事务串行化：并发请求若各自读到同一份旧值，后失败的一方
+		// 回滚时会把先成功一方已经生效的设置抹掉（A/B 读到同一旧值）。
+		s.settingsMu.Lock()
+		defer s.settingsMu.Unlock()
+
 		if !s.canClear(r) {
 			writeForbidden(w, "修改设置")
 			return
@@ -205,22 +257,29 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			Autostart     *bool   `json:"autostart"`
 			HotkeyQR      *string `json:"hotkeyQR"`
 			HotkeyHistory *string `json:"hotkeyHistory"`
+			Paused        *bool   `json:"paused"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad json"})
 			return
 		}
-		resp := map[string]any{"ok": true}
-		// autostart / 快捷键 / 保留条数均可分开提交；全部缺失才视为无效请求
+		// autostart / 快捷键 / 保留条数均可分开提交；全部缺失才视为无效请求。
+		// 保留条数允许只提交 maxText 或只提交 maxImage，另一项取当前生效值。
 		if body.Autostart == nil && body.HotkeyQR == nil && body.HotkeyHistory == nil &&
-			(body.MaxText == nil || body.MaxImage == nil) {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing maxText/maxImage"})
+			body.Paused == nil && body.MaxText == nil && body.MaxImage == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请提供 maxText/maxImage 或其它设置项"})
 			return
 		}
-		// 快捷键：两个字段一起提交（或都不提交）。空串表示恢复平台默认。
-		if body.HotkeyQR != nil || body.HotkeyHistory != nil {
-			newQR := s.store.HotkeyQR()
-			newH := s.store.HotkeyHistory()
+
+		// ── 校验阶段：只做检查，绝不改动任何状态 ────────────────────────
+		// 这样「先校验、后统一应用」可以杜绝「返回 500 但 paused 已落盘」
+		// 这类半生效；真正应用时任一步失败都会逆序回滚已生效的改动。
+		var newQR, newH string
+		hotkeyChange := body.HotkeyQR != nil || body.HotkeyHistory != nil
+		if hotkeyChange {
+			// 两个字段一起提交（或都不提交）；未提交的取本次请求前的 effective 值。
+			newQR = s.store.HotkeyQR()
+			newH = s.store.HotkeyHistory()
 			if body.HotkeyQR != nil {
 				newQR = strings.ToLower(strings.TrimSpace(*body.HotkeyQR))
 			}
@@ -228,34 +287,115 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				newH = strings.ToLower(strings.TrimSpace(*body.HotkeyHistory))
 			}
 			if err := validateHotkeyPair(newQR, newH); err != nil {
+				log.Printf("validate hotkey pair: %v", err)
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 				return
 			}
-			// 先重注册（托盘模式下）；失败（如组合键被占用）则不落盘
-			if err := hotkey.Update(newQR, newH); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		}
+		if body.Autostart != nil && !autostart.Supported() {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "当前平台不支持开机自启"})
+			return
+		}
+		// 数值范围：任何被提交的保留条数都必须为正；更细的上下限由
+		// store.SetLimits 夹取。缺省的一项在下面用当前 effective 值补齐。
+		if (body.MaxText != nil && *body.MaxText <= 0) ||
+			(body.MaxImage != nil && *body.MaxImage <= 0) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "保留条数必须为正数"})
+			return
+		}
+
+		// ── 应用阶段：统一落盘，维护逆序回滚列表 ────────────────────────
+		// 旧值一律取「本次请求前的 effective 值」，hotkey 回滚据此重注册。
+		oldPaused := s.store.Paused()
+		oldQR, oldH := s.store.HotkeyQR(), s.store.HotkeyHistory()
+		oldMaxText, oldMaxImage := s.store.MaxText(), s.store.MaxImage()
+		oldAutostart := autostart.Enabled()
+
+		// 单字段 limit：缺的那个取当前 effective 值补齐。
+		limitsChange := body.MaxText != nil || body.MaxImage != nil
+		newMaxText, newMaxImage := oldMaxText, oldMaxImage
+		if body.MaxText != nil {
+			newMaxText = *body.MaxText
+		}
+		if body.MaxImage != nil {
+			newMaxImage = *body.MaxImage
+		}
+
+		var rollback []func()
+		rollbackAll := func() {
+			for i := len(rollback) - 1; i >= 0; i-- {
+				rollback[i]()
+			}
+		}
+		// fail 用具体中文文案回 500，详细错误只写日志，避免泄漏内部路径等。
+		fail := func(msg string, err error) {
+			log.Printf("settings apply failed: %v", err)
+			rollbackAll()
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": msg})
+		}
+		// 落盘失败沿用统一的 storageError 响应（error + storageError 两个字段）。
+		failStorage := func(err error) {
+			log.Printf("settings save failed: %v", err)
+			rollbackAll()
+			writeStorageError(w)
+		}
+
+		resp := map[string]any{"ok": true}
+		if body.Paused != nil {
+			// 先登记回滚：SetPaused 会先改内存值再落盘，失败时也要还原。
+			rollback = append(rollback, func() { _ = s.store.SetPaused(oldPaused) })
+			if err := s.store.SetPaused(*body.Paused); err != nil {
+				failStorage(err)
 				return
 			}
-			s.store.SetHotkeys(newQR, newH)
+			resp["paused"] = s.store.Paused()
+		}
+		if hotkeyChange {
+			// 先重注册（托盘模式下）；失败（如组合键被占用）则回滚前面的改动。
+			// hotkey.Update 自身的失败回滚由 hotkey 包负责。
+			if err := hotkey.Update(newQR, newH); err != nil {
+				fail("快捷键注册失败，组合键可能被其他应用占用", err)
+				return
+			}
+			rollback = append(rollback, func() {
+				if err := hotkey.Update(oldQR, oldH); err != nil {
+					// 二次注册失败时，配置仍会写回旧值，但实际生效的仍是新组合：
+					// 这条日志是排查「快捷键实际生效值与配置不一致」的唯一线索。
+					log.Printf("hotkey rollback failed: %v; 快捷键实际生效值与配置不一致（生效 %q/%q，配置写回 %q/%q）",
+						err, newQR, newH, oldQR, oldH)
+				}
+				if err := s.store.SetHotkeys(oldQR, oldH); err != nil {
+					log.Printf("restore hotkey settings: %v", err)
+				}
+			})
+			if err := s.store.SetHotkeys(newQR, newH); err != nil {
+				fail("快捷键已生效但配置保存失败，请重试", err)
+				return
+			}
 			resp["hotkeyQR"] = s.store.HotkeyQR()
 			resp["hotkeyHistory"] = s.store.HotkeyHistory()
 		}
 		if body.Autostart != nil {
-			if !autostart.Supported() {
-				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "当前平台不支持开机自启"})
-				return
-			}
 			if err := autostart.Set(*body.Autostart); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "设置开机自启失败: " + err.Error()})
+				fail("设置开机自启失败，请检查系统权限", err)
 				return
 			}
+			rollback = append(rollback, func() { _ = autostart.Set(oldAutostart) })
 			resp["autostart"] = autostart.Enabled()
 		}
-		if body.MaxText != nil && body.MaxImage != nil {
-			trimmedText, trimmedImage := s.store.SetLimits(*body.MaxText, *body.MaxImage)
+		if limitsChange {
+			trimmedText, trimmedImage := s.store.SetLimits(newMaxText, newMaxImage)
+			// Save 成功前不删图片文件：失败时先 RestoreTrim 把记录放回内存，
+			// 再把上限还原成旧值。
+			rollback = append(rollback, func() {
+				s.store.RestoreTrim()
+				s.store.SetLimits(oldMaxText, oldMaxImage)
+			})
 			if err := s.store.Save(); err != nil {
-				log.Printf("save after settings: %v", err)
+				failStorage(err)
+				return
 			}
+			s.store.CommitTrim()
 			resp["maxText"] = s.store.MaxText()
 			resp["maxImage"] = s.store.MaxImage()
 			resp["trimmedText"] = trimmedText
@@ -279,19 +419,87 @@ func hotkeyOrDefault(s string, def func() string) string {
 // pair that presses the same keys. Empty combos are validated against the
 // platform defaults so a reset request is still checked.
 func validateHotkeyPair(qr, hist string) error {
-	cQR, err := hotkey.Parse(hotkeyOrDefault(qr, store.DefaultHotkeyQR))
+	effQR := hotkeyOrDefault(qr, store.DefaultHotkeyQR)
+	effH := hotkeyOrDefault(hist, store.DefaultHotkeyHistory)
+	cQR, err := hotkey.Parse(effQR)
 	if err != nil {
 		return fmt.Errorf("二维码快捷键无效: %w", err)
 	}
-	cH, err := hotkey.Parse(hotkeyOrDefault(hist, store.DefaultHotkeyHistory))
+	cH, err := hotkey.Parse(effH)
 	if err != nil {
 		return fmt.Errorf("历史快捷键无效: %w", err)
 	}
 	if hotkey.Same(cQR, cH) {
 		return errors.New("两个快捷键不能相同")
 	}
+	// 系统保留组合：注册多半会失败或劫持系统功能，直接拒绝并给出可操作文案。
+	if msg := reservedHotkeyMessage(effQR); msg != "" {
+		return errors.New(msg)
+	}
+	if msg := reservedHotkeyMessage(effH); msg != "" {
+		return errors.New(msg)
+	}
 	return nil
 }
+
+// reservedHotkeyMessage reports the user-facing error for a combo that the OS
+// reserves, or "" when the combo is free to use. It works on the canonical
+// string form ("meta+shift+q") instead of hotkey.Combo so it does not depend on
+// the hotkey package's internal layout.
+//
+// 判定要求「该修饰键是唯一修饰键」：⌘Q / Ctrl+C 这类系统组合都是不带 Shift
+// 的裸组合，而 ⌘⇧Q（默认二维码快捷键）并不被系统占用，不能误伤。
+func reservedHotkeyMessage(combo string) string {
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(combo)), "+")
+	if len(parts) < 2 {
+		return ""
+	}
+	key := strings.TrimSpace(parts[len(parts)-1])
+	mods := make(map[string]bool, 3)
+	for _, p := range parts[:len(parts)-1] {
+		switch strings.TrimSpace(p) {
+		case "meta", "cmd", "command", "win":
+			mods["meta"] = true
+		case "ctrl", "control":
+			mods["ctrl"] = true
+		case "alt", "option", "opt":
+			mods["alt"] = true
+		case "shift":
+			mods["shift"] = true
+		default:
+			return "" // 未知修饰键：交给 hotkey.Parse 报错，不在这里猜
+		}
+	}
+	only := func(mod string) bool { return len(mods) == 1 && mods[mod] }
+
+	switch runtime.GOOS {
+	case "darwin":
+		if only("meta") {
+			switch key {
+			case "q", "w", "tab", "space", "m", "h":
+				return "该组合为系统保留（如 ⌘Q 退出、⌘Space 聚焦搜索），请换一个组合"
+			}
+		}
+	case "windows":
+		if only("ctrl") {
+			switch key {
+			case "c", "v", "x", "z", "a":
+				return "该组合为系统保留（如 Ctrl+C 复制、Ctrl+V 粘贴），请换一个组合"
+			}
+		}
+		if only("alt") && key == "f4" {
+			return "该组合为系统保留（如 Alt+F4 关闭窗口），请换一个组合"
+		}
+		if only("meta") && key == "l" {
+			return "该组合为系统保留（如 Win+L 锁定屏幕），请换一个组合"
+		}
+	}
+	return ""
+}
+
+// imageNameRE 只放行 store 实际会生成的文件名：<id>.png / <id>-<nano>.png。
+// 它是 /api/image 的第一道白名单，挡住 ../ 之类的构造路径。
+var imageNameRE = regexp.MustCompile(`^\d+(-\d+)?\.png$`)
 
 func (s *Server) handleImage(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseInt(r.URL.Query().Get("id"), 10, 64)
@@ -304,9 +512,62 @@ func (s *Server) handleImage(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	name := filepath.Base(path)
+	if !imageNameRE.MatchString(name) {
+		http.NotFound(w, r)
+		return
+	}
+	// 最终路径必须仍在 images 目录内：解析目录级软链后再做包含校验，
+	// 防止 images 目录或其父目录被换成指向别处的软链。
+	if !resolvedInsideImageDir(path) {
+		http.NotFound(w, r)
+		return
+	}
+	// Lstat 不跟随软链：目标本身是符号链接就拒绝（否则可指向 ~/.ssh/id_rsa）。
+	// 全平台可用，不用 syscall.O_NOFOLLOW。
+	info, err := os.Lstat(path)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		http.NotFound(w, r)
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer f.Close()
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "image/png")
-	http.ServeFile(w, r, path)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// 显式 ServeContent（而非 ServeFile 的路径协商 + 跟随软链行为）。
+	http.ServeContent(w, r, name, info.ModTime(), f)
+}
+
+// resolvedInsideImageDir reports whether path, once every symlink in it is
+// resolved, still lives directly inside filepath.Dir(path) (the images dir).
+// It is a containment check only; the actual symlink rejection is the Lstat in
+// handleImage. All calls here are cross-platform (no O_NOFOLLOW / syscall).
+func resolvedInsideImageDir(path string) bool {
+	dir := filepath.Dir(path)
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return false
+	}
+	realPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(realDir, realPath)
+	if err != nil {
+		return false
+	}
+	return rel != ".." &&
+		!strings.HasPrefix(rel, ".."+string(filepath.Separator)) &&
+		!filepath.IsAbs(rel)
 }
 
 // handleSuppress marks a payload as "copied from the service page" so the
@@ -347,7 +608,11 @@ func (s *Server) handleSuppress(w http.ResponseWriter, r *http.Request) {
 		s.store.DropRecentText(body.Content, recentWindow)
 	}
 
-	_ = s.store.Save()
+	if err := s.store.Save(); err != nil {
+		log.Printf("save after suppress: %v", err)
+		writeStorageError(w)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -388,11 +653,13 @@ func (s *Server) handleAddText(w http.ResponseWriter, r *http.Request) {
 		log.Printf("added %d chars of text pushed from %s", len([]rune(body.Content)), r.RemoteAddr)
 		if err := s.store.Save(); err != nil {
 			log.Printf("save: %v", err)
+			writeStorageError(w)
+			return
 		}
 		tray.UpdateHistory(s.Recent(tray.HistoryCount))
 	}
 	// added=false：与最新一条重复，store 未变化（前端据此提示，不算失败）
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "added": added})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "added": added, "paused": s.store.Paused()})
 }
 
 // handleAddImage stores an image picked on a phone (photo library or files)
@@ -438,10 +705,12 @@ func (s *Server) handleAddImage(w http.ResponseWriter, r *http.Request) {
 		log.Printf("added image (%d KB) uploaded from %s", len(data)/1024, r.RemoteAddr)
 		if err := s.store.Save(); err != nil {
 			log.Printf("save: %v", err)
+			writeStorageError(w)
+			return
 		}
 		tray.UpdateHistory(s.Recent(tray.HistoryCount))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "added": added})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "added": added, "paused": s.store.Paused()})
 }
 
 // toPNGBytes normalises an uploaded image to PNG. PNG input is passed through
@@ -486,9 +755,21 @@ func checkImagePixels(w, h int) error {
 }
 
 func (s *Server) handleQR(w http.ResponseWriter, r *http.Request) {
-	text := r.URL.Query().Get("text")
+	// 剔除 C0/C1 控制字符：它们既无助于 URL，又会污染编码结果。
+	text := stripC0C1(r.URL.Query().Get("text"))
 	if text == "" {
 		text = s.currentShareURL()
+	} else {
+		if len(text) > maxQRTextBytes {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "二维码内容过长"})
+			return
+		}
+		// 只允许生成本服务地址的二维码：否则页面就成了「给任意文本/外链
+		// 生成二维码」的工具，也能被用来伪装成本服务的入口。
+		if !s.qrTextAllowed(text, r) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "仅支持生成本服务地址的二维码"})
+			return
+		}
 	}
 	png, err := qrcode.Encode(text, qrcode.Medium, 512)
 	if err != nil {
@@ -498,6 +779,47 @@ func (s *Server) handleQR(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "image/png")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write(png)
+}
+
+// stripC0C1 removes C0 (0x00-0x1F, 0x7F) and C1 (0x80-0x9F) control runes.
+func stripC0C1(v string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			return -1
+		}
+		return r
+	}, v)
+}
+
+// qrTextAllowed reports whether raw is an http(s) URL pointing back at this
+// service: a loopback host, one of this machine's current LAN addresses, or the
+// host the request itself was addressed to.
+func (s *Server) qrTextAllowed(raw string, r *http.Request) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	if host == strings.ToLower(hostOnly(r.Host)) {
+		return true
+	}
+	s.refreshNet() // 本机地址集随网络切换动态更新
+	s.netMu.Lock()
+	ok := s.localIPs[host]
+	s.netMu.Unlock()
+	return ok
 }
 
 // handleActivate is the "already running" ping.
@@ -530,13 +852,12 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 }
 
 // canClear reports whether the request comes from the machine running the
-// service (loopback or one of its own network addresses). Mobile browsers are
-// never allowed to clear, even when they reach the service through a local
-// proxy (in which case the source IP looks local).
+// service (loopback or one of its own network addresses).
+//
+// 安全边界只看来源 IP，不看 User-Agent / Sec-CH-UA-Mobile 这类可伪造的头。
+// 本机任意进程仍可调用特权接口，这是产品取舍（用户明确不做鉴权）；UA 之类
+// 只用于 UI 分流，不是安全边界，因此这里不再读取它。
 func (s *Server) canClear(r *http.Request) bool {
-	if isMobileRequest(r) {
-		return false
-	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
@@ -555,31 +876,14 @@ func (s *Server) canClear(r *http.Request) bool {
 	return ips[ip.String()]
 }
 
-// isMobileUA reports whether the request looks like it comes from a mobile
-// browser. It checks both the classic User-Agent keywords and the Client Hints
-// header sent by Chromium browsers.
-func isMobileUA(ua string) bool {
-	if strings.TrimSpace(ua) == "" {
-		return false
-	}
-	ua = strings.ToLower(ua)
-	for _, kw := range []string{
-		"android", "iphone", "ipod", "ipad", "mobile", "windows phone",
-		"micromessenger", "harmonyos", "okhttp", "webview",
-	} {
-		if strings.Contains(ua, kw) {
-			return true
-		}
-	}
-	return false
-}
-
-// isMobileRequest combines the User-Agent and the Sec-CH-UA-Mobile client hint.
-func isMobileRequest(r *http.Request) bool {
-	if strings.TrimSpace(r.Header.Get("Sec-CH-UA-Mobile")) == "?1" {
-		return true
-	}
-	return isMobileUA(r.UserAgent())
+// writeStorageError 统一写接口落盘失败的响应：只回固定泛化文案，详细错误
+// 由调用方 log.Printf，避免把路径等内部信息泄漏给客户端；storageError 字段
+// 供前端显示，与 GET 接口里的 storageError 同为字符串。
+func writeStorageError(w http.ResponseWriter) {
+	writeJSON(w, http.StatusInternalServerError, map[string]any{
+		"error":        "保存失败，请稍后重试",
+		"storageError": "保存失败，请稍后重试",
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
@@ -600,6 +904,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/favicon.ico", s.handleFavicon)
 	mux.HandleFunc("/favicon.png", s.handleFavicon)
 	mux.HandleFunc("/appicon.png", s.handleAppIcon)
+	mux.HandleFunc("/app.js", s.handleAppJS)
+	mux.HandleFunc("/theme.js", s.handleThemeJS)
+	mux.HandleFunc("/app.css", s.handleAppCSS)
 	mux.HandleFunc("/api/records", s.handleRecords)
 	mux.HandleFunc("/api/recent", s.handleRecent)
 	mux.HandleFunc("/api/clear", allowMethods(s.handleClear, http.MethodPost))
@@ -610,5 +917,36 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/qr", s.handleQR)
 	mux.HandleFunc("/api/settings", allowMethods(s.handleSettings, http.MethodGet, http.MethodPost))
 	mux.HandleFunc("/api/activate", allowMethods(s.handleActivate, http.MethodPost))
-	return mux
+	// 由外到内：安全响应头 → Host 白名单（防 DNS rebinding）→ 读请求同源校验
+	// → 写请求三道防线。guardReads 只作用于 /api/* 非写方法，页面与静态资源、
+	// 以及非浏览器客户端的无 Sec-Fetch-Site 请求都不受影响。
+	return securityHeaders(s.guardHost(s.guardReads(s.guardWrites(mux))))
+}
+
+// securityHeaders hardens the page and the API responses. JS/CSS live in
+// separate same-origin files (web/app.js, web/theme.js, web/app.css), so the
+// CSP no longer needs 'unsafe-inline'; everything stays locked to same-origin.
+func securityHeaders(next http.Handler) http.Handler {
+	const csp = "default-src 'self'; " +
+		"script-src 'self'; " +
+		"style-src 'self'; " +
+		"img-src 'self' data: blob:; " +
+		"connect-src 'self'; object-src 'none'; base-uri 'none'; " +
+		"form-action 'self'; frame-ancestors 'self'"
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "SAMEORIGIN")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Content-Security-Policy", csp)
+		// 所有响应（页面、静态资源、API）都禁缓存：剪贴板正文经中间代理或
+		// 磁盘缓存留存下来，就违背了「本机/局域网内即用即走」的预期。
+		h.Set("Cache-Control", "no-store")
+		h.Set("Pragma", "no-cache")
+		h.Set("Expires", "0")
+		// 只阻止跨站加载本资源；同源页面（含手机直连 LAN IP）正常。
+		h.Set("Cross-Origin-Resource-Policy", "same-origin")
+		h.Set("Vary", "Origin")
+		next.ServeHTTP(w, r)
+	})
 }

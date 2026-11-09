@@ -8,6 +8,7 @@ package lancoclip
 // pbpaste subprocess it replaces.
 
 /*
+#cgo darwin CFLAGS: -fobjc-arc
 #cgo LDFLAGS: -framework Cocoa
 #include <stdlib.h>
 // Implemented in lancoclip_native_darwin.m (compiled as Objective-C).

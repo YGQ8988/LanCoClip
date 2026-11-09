@@ -38,7 +38,19 @@ var (
 	// 调 SetTitle/Enable/Show（每次都会触发 systray 的原生更新，托盘菜单
 	// 打开时也如此；减少无谓更新既省开销，也让异常日志只剩真正的变化）。
 	historyApplied []historyRowState
+
+	// menuQuit is closed once on exit; every goroutine started by run()
+	// selects on it so it can return instead of living until process exit.
+	menuQuit     = make(chan struct{})
+	menuQuitOnce sync.Once
 )
+
+// stopMenuLoops asks every goroutine started by run() to return. Hooked into
+// the systray exit paths (menu 退出点击 / tray.Quit / systray onExit).
+// Safe to call multiple times and from any goroutine.
+func stopMenuLoops() {
+	menuQuitOnce.Do(func() { close(menuQuit) })
+}
 
 type historyRowState struct {
 	title    string
@@ -57,6 +69,8 @@ func run(app App, confirmClear func() bool, openURL func(string), opts Options) 
 	// tooltip，正好盖在二维码浮窗上，而用途已经由浮窗表达了。
 	mQR := systray.AddMenuItem("访问二维码", "")
 	mSettings := systray.AddMenuItem("设置", "打开页面并弹出设置（保留条数、快捷键、开机自启）")
+	// 暂停记录：复制密码 / 验证码前可以先关掉记录，状态持久化到 settings.json。
+	mPause := systray.AddMenuItem(pauseTitle(app.Paused()), "暂停后不再保存任何新的剪贴板内容")
 
 	// 历史：30 条，每 10 条一组（组名直接标号 1-10 / 11-20 / 21-30），
 	// 点击条目复制回剪贴板并模拟粘贴。
@@ -71,6 +85,13 @@ func run(app App, confirmClear func() bool, openURL func(string), opts Options) 
 	}
 
 	mClear := systray.AddMenuItem("清除历史", "清除全部文本和图片记录（需二次确认）")
+	// 平台专属排障入口（目前只有 Windows 防火墙）：不需要的平台返回空标题，
+	// 就不会多占一行菜单。hintCh 为 nil 时下面的 select 会一直阻塞，等价于不存在。
+	hintTitle, hintAction := networkHint()
+	var hintCh <-chan struct{}
+	if hintTitle != "" {
+		hintCh = systray.AddMenuItem(hintTitle, "页面在手机上打不开时先看这里").ClickedCh
+	}
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("退出", "退出LanCoClip")
 
@@ -111,24 +132,49 @@ func run(app App, confirmClear func() bool, openURL func(string), opts Options) 
 	// 并向当前焦点应用模拟一次粘贴（与快捷键历史菜单行为一致）。
 	for i := range entries {
 		go func(idx int) {
-			for range entries[idx].ClickedCh {
-				historyMu.RLock()
-				var it Item
-				if idx < len(historyCur) {
-					it = historyCur[idx]
+			for {
+				select {
+				case <-menuQuit:
+					return
+				case <-entries[idx].ClickedCh:
+					historyMu.RLock()
+					var it Item
+					if idx < len(historyCur) {
+						it = historyCur[idx]
+					}
+					historyMu.RUnlock()
+					if it.ID == 0 {
+						continue
+					}
+					copyAndPaste(app, it)
 				}
-				historyMu.RUnlock()
-				if it.ID == 0 {
-					continue
-				}
-				copyAndPaste(app, it)
 			}
 		}(i)
 	}
 
+	// 页面设置里也能切换暂停状态，托盘菜单每秒对齐一次标题，避免两处显示不一致。
+	go func() {
+		last := app.Paused()
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-menuQuit:
+				return
+			case <-t.C:
+				if cur := app.Paused(); cur != last {
+					last = cur
+					mPause.SetTitle(pauseTitle(cur))
+				}
+			}
+		}
+	}()
+
 	go func() {
 		for {
 			select {
+			case <-menuQuit:
+				return
 			case <-mOpen.ClickedCh:
 				openURL(app.LocalURL())
 			case hovered := <-mQR.HoveredCh:
@@ -148,6 +194,13 @@ func run(app App, confirmClear func() bool, openURL func(string), opts Options) 
 					u += "?settings=1"
 				}
 				openURL(u)
+			case <-mPause.ClickedCh:
+				next := !app.Paused()
+				if err := app.SetPaused(next); err != nil {
+					logf("set paused: %v", err)
+					break
+				}
+				mPause.SetTitle(pauseTitle(next))
 			case <-mClear.ClickedCh:
 				if confirmClear() {
 					if err := app.ClearAll(); err != nil {
@@ -155,7 +208,11 @@ func run(app App, confirmClear func() bool, openURL func(string), opts Options) 
 					}
 					UpdateHistory(app.Recent(HistoryCount))
 				}
+			case <-hintCh:
+				hintAction()
 			case <-mQuit.ClickedCh:
+				stopMenuLoops()
+				stopPlatformLoops()
 				systray.Quit()
 				return
 			}
@@ -177,6 +234,15 @@ func showQRPopover(app App) {
 }
 
 var qrErrOnce sync.Once
+
+// pauseTitle describes the action the menu item performs, so the label stays
+// meaningful even when the state was changed from the web page.
+func pauseTitle(paused bool) string {
+	if paused {
+		return "恢复记录（当前已暂停）"
+	}
+	return "暂停记录"
+}
 
 // withParam appends "p" to the page URL as a query parameter (?settings=1 风格).
 func withParam(u, p string) string {

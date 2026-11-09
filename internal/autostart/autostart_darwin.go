@@ -95,7 +95,7 @@ func Set(on bool) error {
 	b.WriteString("  <key>KeepAlive</key><false/>\n")
 	b.WriteString("  <key>ProcessType</key><string>Interactive</string>\n")
 	b.WriteString("</dict>\n</plist>\n")
-	if err := os.WriteFile(p, []byte(b.String()), 0o644); err != nil {
+	if err := os.WriteFile(p, []byte(b.String()), 0o600); err != nil {
 		return err
 	}
 	// load 失败不报错：plist 已就位，下次登录必然生效；本次失败多见于

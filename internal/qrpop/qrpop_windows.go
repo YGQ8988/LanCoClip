@@ -8,6 +8,7 @@ import (
 	_ "image/png" // 注册 PNG 解码器：二维码就是 PNG
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -21,7 +22,12 @@ const (
 	wmApp   = 0x8000 // WM_APP
 	msgShow = wmApp + 1
 	msgHide = wmApp + 2
+	msgQuit = wmApp + 3 // 请求 UI 线程销毁窗口并退出消息循环
 	wmPaint = 0x000F
+	// 退出相关消息：系统结束会话/关闭窗口时也会触发同一套清理。
+	wmClose      = 0x0010
+	wmEndSession = 0x0016
+	wmDestroy    = 0x0002
 	// wmSetCursor asks who owns the pointer; wmNcHitTest decides whether the
 	// pointer is ours at all. The popover must answer "not mine" to both,
 	// otherwise it swallows the menu's hover and the system ends up with no
@@ -73,6 +79,9 @@ var (
 	pValidateRect     = u32.NewProc("ValidateRect")
 	pLoadCursor       = u32.NewProc("LoadCursorW")
 	pSetCursor        = u32.NewProc("SetCursor")
+	pDestroyWindow    = u32.NewProc("DestroyWindow")
+	pUnregisterClass  = u32.NewProc("UnregisterClassW")
+	pPostQuitMessage  = u32.NewProc("PostQuitMessage")
 )
 
 type wndClassEx struct {
@@ -125,6 +134,10 @@ var (
 
 	startOnce sync.Once
 	started   = make(chan struct{})
+
+	// stopped 记录 StopQrPopover 是否已调用。若停止意图先于 UI goroutine
+	// 启动，后者看到后直接退出（并关闭 started，避免 Show 的等待挂死）。
+	stopped atomic.Bool
 )
 
 // Supported reports whether this platform can show the floating window.
@@ -172,6 +185,22 @@ func Hide() {
 	pPostMessage.Call(uintptr(hwnd), uintptr(msgHide), 0, 0)
 }
 
+// StopQrPopover asks the popover UI thread to tear down its window and exit
+// its message loop. It is called from the tray shutdown path; safe to call
+// repeatedly and before the window exists.
+func StopQrPopover() {
+	// 先记下停止意图：若 UI 线程还没起来，它起来后会直接退出。
+	stopped.Store(true)
+	popMu.Lock()
+	hwnd := popHwnd
+	popHwnd = 0
+	popMu.Unlock()
+	if hwnd == 0 {
+		return
+	}
+	pPostMessage.Call(uintptr(hwnd), uintptr(msgQuit), 0, 0)
+}
+
 // ensureWindow starts the UI thread that owns the popover window, waiting until
 // the window exists (or has failed to) so the first hover is not swallowed.
 func ensureWindow() {
@@ -183,6 +212,13 @@ func ensureWindow() {
 // its messages. It must stay on one OS thread for its whole life, hence
 // LockOSThread.
 func uiLoop() {
+	// 停止意图可能先于本 goroutine 启动：直接退出，但仍要关闭 started，
+	// 否则 ensureWindow 的等待方会永久挂住。
+	if stopped.Load() {
+		close(started)
+		return
+	}
+
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
@@ -250,6 +286,20 @@ func wndProc(hwnd windows.Handle, message uint32, wParam, lParam uintptr) uintpt
 		return 0
 	case msgHide:
 		pShowWindow.Call(uintptr(hwnd), uintptr(swHide))
+		return 0
+	case msgQuit, wmClose, wmEndSession:
+		// DestroyWindow 是同步的：会立即回调 wmDestroy 完成统一清理。
+		pDestroyWindow.Call(uintptr(hwnd))
+		return 0
+	case wmDestroy:
+		// 窗口已销毁：注销窗口类并结束消息循环，让 uiLoop 的 GetMessage
+		// 返回 0、defer UnlockOSThread 得以执行。
+		if inst, _, _ := pGetModuleHandle.Call(0); inst != 0 {
+			if cls, err := windows.UTF16PtrFromString(className); err == nil {
+				pUnregisterClass.Call(uintptr(unsafe.Pointer(cls)), inst)
+			}
+		}
+		pPostQuitMessage.Call(0)
 		return 0
 	case wmPaint:
 		draw(hwnd)

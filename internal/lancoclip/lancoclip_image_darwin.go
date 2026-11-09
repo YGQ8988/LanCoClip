@@ -13,6 +13,7 @@ import "C"
 
 import (
 	"errors"
+	"runtime"
 	"unsafe"
 )
 
@@ -35,6 +36,9 @@ func WriteImage(png []byte) error {
 	}
 	// len(png) is guaranteed > 0 here: the guard above returns on empty input.
 	p := (*C.char)(unsafe.Pointer(&png[0]))
+	// C 侧会 dispatch_sync 到主线程后才用完 bytes；KeepAlive 保证 Go 切片
+	// 在整个 C 调用期间不会被 GC 回收（cgo 传递 Go 指针的硬性要求）。
+	defer runtime.KeepAlive(png)
 	switch C.writeLancoclipPNG(p, C.int(len(png))) {
 	case 0:
 		return nil

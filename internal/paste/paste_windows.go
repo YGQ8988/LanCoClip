@@ -56,11 +56,24 @@ type input struct {
 
 // ── 焦点追踪 ────────────────────────────────────────────────
 var (
-	focusOnce   sync.Once
-	focusMu     sync.Mutex
-	lastFocus   uintptr
-	focusFrozen int32
+	focusOnce     sync.Once
+	focusStopOnce sync.Once
+	focusQuit     = make(chan struct{})
+	focusMu       sync.Mutex
+	lastFocus     uintptr
+	focusFrozen   int32
+	// focusStopped 记录 StopFocusTracker 是否已调用。若停止意图先于追踪
+	// goroutine 启动，后者看到后直接退出，不再记录焦点。
+	focusStopped atomic.Bool
 )
+
+// StopFocusTracker asks the focus polling goroutine to return. It is called
+// from the tray shutdown path; safe to call multiple times and before Do().
+func StopFocusTracker() {
+	// 先记下停止意图：若追踪 goroutine 还没起来，它起来后会直接退出。
+	focusStopped.Store(true)
+	focusStopOnce.Do(func() { close(focusQuit) })
+}
 
 // FreezeFocus 暂停焦点记录：菜单项点击后到粘贴发出前的窗口里，
 // 前台可能短暂变成资源管理器外壳，不应覆盖已记住的目标窗口。
@@ -70,6 +83,14 @@ func FreezeFocus() { atomic.StoreInt32(&focusFrozen, 1) }
 func startFocusTracker() {
 	focusOnce.Do(func() {
 		go func() {
+			// 停止意图可能先于本 goroutine 启动：直接退出。
+			if focusStopped.Load() {
+				return
+			}
+			// 保持原来的节奏：每轮先立即记录一次前台窗口，再等 300ms。
+			// select 兼顾退出信号，ticker 在 return 时由 defer Stop。
+			t := time.NewTicker(300 * time.Millisecond)
+			defer t.Stop()
 			for {
 				if atomic.LoadInt32(&focusFrozen) == 0 {
 					if h, _, _ := procGetForegroundWindow.Call(); h != 0 && !isOurWindow(h) {
@@ -78,7 +99,11 @@ func startFocusTracker() {
 						focusMu.Unlock()
 					}
 				}
-				time.Sleep(300 * time.Millisecond)
+				select {
+				case <-focusQuit:
+					return
+				case <-t.C:
+				}
 			}
 		}()
 	})

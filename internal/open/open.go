@@ -26,5 +26,10 @@ func Open(url string) {
 		cmd = exec.Command("xdg-open", url)
 	}
 	winhide.Hide(cmd)
-	_ = cmd.Start()
+	if err := cmd.Start(); err != nil {
+		return
+	}
+	// Start 成功后必须 Wait，否则子进程退出后会变成僵尸进程；放到后台
+	// goroutine 里执行，保持 Open 不阻塞调用方。
+	go func() { _ = cmd.Wait() }()
 }

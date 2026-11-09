@@ -15,11 +15,8 @@ cd "$(dirname "$0")"
 export COPYFILE_DISABLE=1
 mkdir -p dist .build winres
 
-APP_NAME="LanCoClip"
-DISPLAY_NAME="剪贴板"
-VERSION="${1:-1.2.2}"
-# 构建时间（本机时区，即北京时间），注入 main.buildTime，设置弹窗里随版本号一起展示
-BUILD_TIME="$(date '+%Y-%m-%d %H:%M')"
+# 版本 / 命名统一来自 build-config.sh，避免两个平台出包时不同步
+source ./build-config.sh "$1"
 echo "构建版本：${VERSION}（${BUILD_TIME}）"
 echo "Go 工具链：$(go version)（go.mod 要求 1.26.10+，含 CVE-2026-111943 修复）"
 
@@ -112,3 +109,6 @@ ls -lh dist/*windows*.zip 2>/dev/null | awk '{printf "  %-8s %s\n", $5, $NF}'
 echo ""
 echo "用法：解压 zip 得到 ${APP_NAME}.exe，双击运行 —— 任务栏（通知区域）出现图标，右键可『打开页面』或『退出』。"
 echo "首次运行若被 SmartScreen 拦截，选择「更多信息 → 仍要运行」（未签名程序的常规提示）。"
+echo ""
+echo "分发提示：exe 未做数字签名，SmartScreen 会拦截；『剪贴板监听 + 全局热键 + 开机自启』"
+echo "          也是剪贴板类木马的常见特征组合，部分杀软可能误报。公开分发建议购买代码签名证书。"
