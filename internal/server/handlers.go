@@ -133,14 +133,18 @@ func (s *Server) handleRecords(w http.ResponseWriter, r *http.Request) {
 	textCount, imageCount := s.store.Counts()
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"records":      records,
-		"type":         kind,
-		"page":         page,
-		"size":         size,
-		"total":        total,
-		"totalPages":   totalPages,
-		"hasMore":      page*size < total,
-		"counts":       map[string]int{"text": textCount, "image": imageCount},
+		"records":    records,
+		"type":       kind,
+		"page":       page,
+		"size":       size,
+		"total":      total,
+		"totalPages": totalPages,
+		"hasMore":    page*size < total,
+		"counts": map[string]int{
+			"text":     textCount,
+			"image":    imageCount,
+			"favorite": s.store.FavoriteCount(),
+		},
 		"settings":     map[string]int{"maxText": s.store.MaxText(), "maxImage": s.store.MaxImage()},
 		"canClear":     s.canClear(r),
 		"shareUrl":     s.currentShareURL(),
@@ -161,8 +165,11 @@ func queryInt(r *http.Request, key string, def int) int {
 
 // parseKind normalises the ?type= parameter; anything unknown means text.
 func parseKind(v string) string {
-	if v == store.KindImage {
+	switch v {
+	case store.KindImage:
 		return store.KindImage
+	case store.KindFavorite:
+		return store.KindFavorite
 	}
 	return store.KindText
 }
@@ -616,6 +623,73 @@ func (s *Server) handleSuppress(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// handleFavorite marks / unmarks a text record as a favourite. It is open to
+// the LAN like /api/add-text: marking is additive (a flag on an existing
+// record), never destructive, and a phone browsing the history is exactly
+// where you want to keep something. Rate limiting / CSRF still apply through
+// guardWrites.
+func (s *Server) handleFavorite(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID       int64 `json:"id"`
+		Favorite *bool `json:"favorite"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad json"})
+		return
+	}
+	if body.ID <= 0 || body.Favorite == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "缺少 id 或 favorite"})
+		return
+	}
+	found, changed := s.store.SetFavorite(body.ID, *body.Favorite)
+	if !found {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "记录不存在"})
+		return
+	}
+	if changed {
+		if err := s.store.Save(); err != nil {
+			log.Printf("save after favorite: %v", err)
+			writeStorageError(w)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"id":        body.ID,
+		"favorite":  *body.Favorite,
+		"favorites": s.store.FavoriteCount(),
+	})
+}
+
+// handleUnfavoriteAll clears every favourite marker in one shot. Unlike the
+// single /api/favorite toggle this is a bulk destructive action, so it uses
+// the same machine-only permission as /api/clear; a phone can still unmark
+// records one by one through /api/favorite.
+// The button is labelled "清空全部收藏" to match the text/image clear buttons,
+// but it only drops flags — unlike /api/clear it never deletes a record.
+func (s *Server) handleUnfavoriteAll(w http.ResponseWriter, r *http.Request) {
+	if !s.canClear(r) {
+		writeForbidden(w, "批量取消收藏")
+		return
+	}
+	ids := s.store.UnfavoriteAll()
+	if len(ids) > 0 {
+		if err := s.store.Save(); err != nil {
+			// 内存先改再落盘：写失败必须把标记放回去，否则页面显示已清空、
+			// 磁盘还是旧数据，重启后收藏「复活」。
+			s.store.RestoreFavorites(ids)
+			log.Printf("save after unfavorite-all: %v", err)
+			writeStorageError(w)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"cleared":   len(ids),
+		"favorites": s.store.FavoriteCount(),
+	})
+}
+
 // ── 手机端推送：把手机上的文本 / 图片直接写进服务本机的记录 ───────────────
 // 与剪贴板捕获共用同一个 store，但不碰系统剪贴板，所以不需要 suppressor
 // 抑制：本机 lancoclipWatcher 不会因为这条记录再多记一次。
@@ -911,6 +985,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/recent", s.handleRecent)
 	mux.HandleFunc("/api/clear", allowMethods(s.handleClear, http.MethodPost))
 	mux.HandleFunc("/api/suppress", allowMethods(s.handleSuppress, http.MethodPost))
+	mux.HandleFunc("/api/favorite", allowMethods(s.handleFavorite, http.MethodPost))
+	mux.HandleFunc("/api/unfavorite-all", allowMethods(s.handleUnfavoriteAll, http.MethodPost))
 	mux.HandleFunc("/api/image", s.handleImage)
 	mux.HandleFunc("/api/add-text", allowMethods(s.handleAddText, http.MethodPost))
 	mux.HandleFunc("/api/add-image", allowMethods(s.handleAddImage, http.MethodPost))

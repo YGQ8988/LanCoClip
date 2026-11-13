@@ -45,6 +45,7 @@
     <nav class="tabs" id="tabs" role="tablist" aria-label="记录类型">
       <button class="tab active" id="tabText" role="tab" aria-selected="true">文本<span class="tab-badge" id="badgeText"></span></button>
       <button class="tab" id="tabImage" role="tab" aria-selected="false">图片<span class="tab-badge" id="badgeImage"></span></button>
+      <button class="tab" id="tabFavorite" role="tab" aria-selected="false">收藏<span class="tab-badge" id="badgeFavorite"></span></button>
     </nav>
     <!-- 右翼：主题切换 → 设置 → 清空全部（清空在最右端） -->
     <span class="tb-side right">
@@ -66,8 +67,10 @@
           <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 9 19.36a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.64 15a1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.64 9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.64a1.7 1.7 0 0 0 1.03-1.56V3a2 2 0 1 1 4 0v.09A1.7 1.7 0 0 0 15 4.64a1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.36 9v.09a1.7 1.7 0 0 0 1.56 1.03H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51.88z"/>
         </svg>
       </button>
-      <!-- 清空按钮：同样仅服务本机可见；手机端两者都会从 DOM 移除 -->
+      <!-- 清空按钮：同样仅服务本机可见；手机端两者都会从 DOM 移除。
+           收藏 tab 时与「清空全部收藏」互斥显示，位置不变，三者命名保持统一 -->
       <button class="btn danger" id="clearBtn" hidden>清空全部文本</button>
+      <button class="btn danger" id="unfavAllBtn" hidden>清空全部收藏</button>
     </span>
   </section>
 
@@ -161,6 +164,21 @@
       <h2>历史记录 <span class="hist-sub">最近 30 条 · 点击复制</span></h2>
       <ul class="hist-list" id="histList"></ul>
       <div class="empty" id="histEmpty" hidden>暂无剪贴板记录</div>
+    </div>
+  </div>
+
+  <!-- 统一的居中确认弹窗：清空全部文本 / 清空全部图片 / 清空全部收藏共用。
+       不用浏览器内置 confirm（样式不可控、位置在窗口顶部而不是页面中间）。
+       三个操作的确认按钮一律写「确认」，具体做什么由标题和说明文案交代 -->
+  <div class="modal" id="confirmModal" hidden>
+    <div class="modal-card confirm-card" role="alertdialog" aria-modal="true"
+         aria-labelledby="confirmTitle" aria-describedby="confirmText">
+      <h2 id="confirmTitle">确认操作</h2>
+      <p class="confirm-text" id="confirmText"></p>
+      <div class="modal-actions">
+        <button class="btn block" id="confirmCancel" type="button">取消</button>
+        <button class="btn danger block" id="confirmOk" type="button">确认</button>
+      </div>
     </div>
   </div>
 

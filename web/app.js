@@ -5,7 +5,13 @@
   var shareUrlEl = document.getElementById('shareUrl');
   var shareEl = document.querySelector('.share');
   var clearBtn = document.getElementById('clearBtn');
+  var unfavAllBtn = document.getElementById('unfavAllBtn');
   var settingsBtn = document.getElementById('settingsBtn');
+  var confirmModal = document.getElementById('confirmModal');
+  var confirmTitleEl = document.getElementById('confirmTitle');
+  var confirmTextEl = document.getElementById('confirmText');
+  var confirmOkBtn = document.getElementById('confirmOk');
+  var confirmCancelBtn = document.getElementById('confirmCancel');
   var modal = document.getElementById('qrModal');
   var qrImg = document.getElementById('qrImg');
   var qrUrl = document.getElementById('qrUrl');
@@ -18,8 +24,10 @@
   var loadmoreEl = document.getElementById('loadmore');
   var tabText = document.getElementById('tabText');
   var tabImage = document.getElementById('tabImage');
+  var tabFavorite = document.getElementById('tabFavorite');
   var badgeText = document.getElementById('badgeText');
   var badgeImage = document.getElementById('badgeImage');
+  var badgeFavorite = document.getElementById('badgeFavorite');
   var themeBtn = document.getElementById('themeBtn');
   var settingsModal = document.getElementById('settingsModal');
   var settingsClose = document.getElementById('settingsClose');
@@ -54,23 +62,37 @@
   var addTextCancel = document.getElementById('addTextCancel');
   var addTextClose = document.getElementById('addTextClose');
 
-  var EMPTY_TEXT = { text: '暂无文本记录，去电脑上复制点内容试试', image: '暂无图片记录，去电脑上复制张图片试试' };
+  var EMPTY_TEXT = {
+    text: '暂无文本记录，去电脑上复制点内容试试',
+    image: '暂无图片记录，去电脑上复制张图片试试',
+    favorite: '还没有收藏的文本，去「文本」里点一下「收藏」就会出现在这里'
+  };
 
-  var PAGE_SIZE = 10; // H5 每次上滑追加 10 条；PC 在下面按模式改成 32 条/页
+  // 每页条数：文本 / 收藏 28 条 = 4 列 × 7 行，图片 8 条 = 4 列 × 2 行。
+  // 服务端只认 size 参数，分页大小完全由前端决定。
+  var PAGE_SIZE = { text: 28, image: 8, favorite: 28 };
   var FAB_POS_KEY = 'lanoclip-fab-pos'; // 悬浮「添加」按钮拖动后的位置（视口 px）
 
   var state = {
     shareUrl:'', canClear:false, openIds:{},
     settings:{maxText:500, maxImage:200, autostart:false, autostartSupported:false, paused:false},
     storageError:'',  // 最近一次写盘异常，变化时只提示一次
-    type:'text',      // 当前 tab：text | image（文本与图片分开分页）
+    type:'text',      // 当前 tab：text | image | favorite（各自分页）
     page:1,           // PC 当前页
     pages:1,          // H5 已加载页数
     total:0, totalPages:1, hasMore:false,
+    favorites:0,      // 收藏总数（tab 角标）
     firstSig:'',      // 第 1 页签名，用于轮询判断是否有新数据
     sig:'',           // 当前已渲染列表的签名
     loading:false,
   };
+
+  function pageSize(){ return PAGE_SIZE[state.type] || PAGE_SIZE.text; }
+  function countLabel(){
+    return state.type === 'favorite'
+      ? '共 ' + state.total + ' 条收藏'
+      : '共 ' + state.total + ' 条记录';
+  }
 
   // 手机端一律不展示「清空全部」并默认单列。UA 是第一判据，触摸能力只在
   // 「非桌面系统」时作为补充判据：iPadOS 13+ 的 Safari 会把自己伪装成
@@ -99,9 +121,9 @@
   // 图片 tab 固定高度按模式取值（PC 200px / H5 240px），直接读 CSS 变量保证判断与样式一致；
   // 必须在 body 加上 is-pc/is-h5 之后再读，否则拿到的还是 :root 的 PC 值
   var SHOT_H = parseFloat(getComputedStyle(document.body).getPropertyValue('--shot-h')) || 200;
-  // PC 每页 32 条（4 列 × 8 行），H5 每次追加 10 条
+  // PC 每页按类型定（文本/收藏 28 = 4 列 × 7 行，图片 8 = 4 列 × 2 行），
+  // 手机上同样按这个粒度上滑追加
   if (mode === 'pc'){
-    PAGE_SIZE = 32;
     listEl.classList.add('cols-4');
   }
 
@@ -206,7 +228,7 @@
     records.forEach(function(r){ appendItem(r); });
     emptyEl.hidden = state.total > 0;
     emptyEl.textContent = EMPTY_TEXT[state.type] || EMPTY_TEXT.text;
-    countEl.textContent = '共 ' + state.total + ' 条记录';
+    countEl.textContent = countLabel();
   }
 
   function appendItem(r){
@@ -218,7 +240,7 @@
     li.dataset.sum = r.imageSum || '';
     if (!isImage) li.dataset.text = r.content || '';
 
-    // 头部一行：时间 + 展开 + 复制/保存
+    // 头部一行：时间 + 展开（固定最左） + 弹性空隙 + 收藏 + 复制/保存
     var head = document.createElement('div');
     head.className = 'item-head';
 
@@ -226,15 +248,30 @@
     t.className = 'time'; t.textContent = fmtTime(r.createdAt);
     head.appendChild(t);
 
-    var spacer = document.createElement('span');
-    spacer.className = 'spacer';
-    head.appendChild(spacer);
-
+    // 「展开/收起」永远固定在最左边（紧跟时间、spacer 之前），
+    // 不夹在「收藏 / 取消收藏」和「复制 / 保存」中间。放在 spacer 左侧
+    // 还能保证它显隐时右侧按钮不被推走。是否显示由末尾 applyClamp() 决定。
     var toggle = document.createElement('button');
     toggle.className = 'toggle';
     toggle.hidden = true;
     toggle.textContent = state.openIds[r.id] ? '收起' : '展开';
     head.appendChild(toggle);
+
+    var spacer = document.createElement('span');
+    spacer.className = 'spacer';
+    head.appendChild(spacer);
+
+    // 收藏只作用于文本：文本 tab 与收藏 tab 都有这颗按钮，
+    // 收藏显示「取消收藏」，未收藏显示「收藏」。
+    if (!isImage){
+      var favBtn = document.createElement('button');
+      favBtn.type = 'button';
+      favBtn.className = 'btn sm fav' + (r.favorite ? ' on' : '');
+      favBtn.textContent = r.favorite ? '取消收藏' : '收藏';
+      favBtn.title = r.favorite ? '从收藏中移除' : '收藏这条文本';
+      favBtn.addEventListener('click', function(){ toggleFavorite(r, favBtn, li); });
+      head.appendChild(favBtn);
+    }
 
     if (isImage){
       // 写图片到剪贴板依赖 ClipboardItem，手机浏览器基本不支持，故只在桌面端给出「复制」
@@ -306,6 +343,42 @@
       applyClamp();
     }
     return li;
+  }
+
+  // 收藏 / 取消收藏：先落服务端，再按结果改按钮。收藏 tab 上取消收藏后
+  // 这条记录不再属于当前视图，直接从列表里摘掉并更新计数（不重拉整页，
+  // 避免翻页位置跳动）；下一轮 poll 会按新集合重算签名、补齐分页。
+  function toggleFavorite(r, btn, li){
+    var want = !r.favorite;
+    btn.disabled = true;
+    fetch('/api/favorite', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: r.id, favorite: want })
+    }).then(readJSON).then(function(res){
+      btn.disabled = false;
+      if (!res.ok){ toast((res.j && res.j.error) || '操作失败'); return; }
+      r.favorite = want;
+      btn.textContent = want ? '取消收藏' : '收藏';
+      btn.title = want ? '从收藏中移除' : '收藏这条文本';
+      btn.classList.toggle('on', want);
+      if (typeof res.j.favorites === 'number'){
+        state.favorites = res.j.favorites;
+        badgeFavorite.textContent = state.favorites;
+      }
+      if (!want && state.type === 'favorite'){
+        if (li.parentNode) li.parentNode.removeChild(li);
+        state.total = Math.max(0, state.total - 1);
+        countEl.textContent = countLabel();
+        emptyEl.hidden = state.total > 0;
+        state.sig = '';
+        state.firstSig = '';   // 让下一轮 poll 重新取第 1 页，分页跟着收敛
+      }
+      toast(want ? '已收藏' : '已取消收藏');
+    }).catch(function(){
+      btn.disabled = false;
+      toast('操作失败');
+    });
   }
 
   // ── PC 分页器 ──────────────────────────────────────────────
@@ -392,7 +465,7 @@
     if (mode !== 'h5' || state.loading || !state.hasMore) return;
     state.loading = true;
     setLoadMore('加载中…');
-    fetchPage(state.pages + 1, PAGE_SIZE).then(function(data){
+    fetchPage(state.pages + 1, pageSize()).then(function(data){
       state.loading = false;
       state.pages++;
       state.total = data.total;
@@ -423,6 +496,8 @@
     if (data.counts){
       badgeText.textContent = data.counts.text || 0;
       badgeImage.textContent = data.counts.image || 0;
+      state.favorites = data.counts.favorite || 0;
+      badgeFavorite.textContent = state.favorites;
     }
     // 保留条数配置（设置弹窗回填用）
     if (data.settings){
@@ -452,13 +527,19 @@
       statusNotice.hidden = true;
     }
     var isText = state.type === 'text';
+    var isImage = state.type === 'image';
+    var isFav = state.type === 'favorite';
     tabText.classList.toggle('active', isText);
-    tabImage.classList.toggle('active', !isText);
+    tabImage.classList.toggle('active', isImage);
+    tabFavorite.classList.toggle('active', isFav);
     tabText.setAttribute('aria-selected', isText ? 'true' : 'false');
-    tabImage.setAttribute('aria-selected', isText ? 'false' : 'true');
+    tabImage.setAttribute('aria-selected', isImage ? 'true' : 'false');
+    tabFavorite.setAttribute('aria-selected', isFav ? 'true' : 'false');
 
-    // 清空按钮跟着当前 tab 走：清空全部文本 / 清空全部图片
-    var clearLabel = isText ? '清空全部文本' : '清空全部图片';
+    // clearBtn 的文案跟着 tab 走：清空全部文本 / 清空全部图片；收藏页隐藏它，
+    // 换成同位置的「清空全部收藏」按钮（三个按钮命名统一、位置一致）。
+    // 注意「清空全部收藏」只移除收藏标记、不删除文本记录，语义与另两者不同。
+    var clearLabel = isImage ? '清空全部图片' : '清空全部文本';
     if (clearBtn.textContent !== clearLabel) clearBtn.textContent = clearLabel;
 
     state.canClear = !!data.canClear && !isMobile;
@@ -487,15 +568,22 @@
     }
 
     // 手机端把按钮从 DOM 里彻底移除，不给任何重新显示的机会。
-    // 设置入口与清空按钮同一套权限：仅 PC + 请求来自服务本机时显示。
-    [settingsBtn, clearBtn].forEach(function(b){
+    // 设置入口 / 清空全部文本·图片 / 清空全部收藏同一套权限：仅 PC + 请求来自服务本机时显示。
+    // 两个清空按钮互斥：收藏页只显示「清空全部收藏」，文本/图片页只显示 clearBtn。
+    [settingsBtn, clearBtn, unfavAllBtn].forEach(function(b){
       if (!b) return;
       if (isMobile && b.parentNode){
         b.parentNode.removeChild(b);
       } else {
-        b.hidden = !state.canClear;
+        var visible = state.canClear && (b !== clearBtn || !isFav)
+                                     && (b !== unfavAllBtn || isFav);
+        b.hidden = !visible;
       }
     });
+    // 没有收藏时按钮置灰，不发无意义的请求（收藏页的 total 就是收藏数）
+    if (unfavAllBtn && unfavAllBtn.parentNode){
+      unfavAllBtn.disabled = isFav && !data.total;
+    }
   }
 
   // 断线反馈：状态行已移除，改用页面已有的 toast 提示，不断线时静默。
@@ -516,8 +604,8 @@
     if (state.loading) return Promise.resolve(false);
     state.loading = true;
     var req = (mode === 'pc')
-      ? fetchPage(state.page, PAGE_SIZE)
-      : fetchPage(1, PAGE_SIZE * state.pages);
+      ? fetchPage(state.page, pageSize())
+      : fetchPage(1, pageSize() * state.pages);
 
     return req.then(function(data){
       state.loading = false;
@@ -536,18 +624,18 @@
       // 同步轮询用的「第 1 页签名」。切 tab 时 firstSig 被清空，如果这里不补上，
       // 紧跟着的那次 poll 会以为数据变了、再拉一遍（切一次 tab 请求两次）。
       // PC 只有在停在第 1 页时才有第 1 页的数据可比；H5 一次取的是多页，
-      // 取前 PAGE_SIZE 条才是第 1 页。
+      // 取前 pageSize() 条才是第 1 页。
       if (mode === 'pc'){
         if (state.page === 1) state.firstSig = sig;
       } else {
-        state.firstSig = sigOf((data.records || []).slice(0, PAGE_SIZE));
+        state.firstSig = sigOf((data.records || []).slice(0, pageSize()));
       }
       if (force || sig !== state.sig){
         state.sig = sig;
         render(data.records, false);
       }
       if (mode === 'pc') renderPager();
-      else { state.pages = Math.max(1, Math.ceil(data.records.length / PAGE_SIZE)); updateLoadMore(state.hasMore); }
+      else { state.pages = Math.max(1, Math.ceil(data.records.length / pageSize())); updateLoadMore(state.hasMore); }
       return true;
     }).catch(function(){
       // 关键：失败时必须解锁，否则 state.loading 永远为 true，之后所有
@@ -560,7 +648,7 @@
 
   // 轮询只看第 1 页：有变化再更新当前视图，既省流量又不打断阅读
   function poll(){
-    fetchPage(1, PAGE_SIZE).then(function(data){
+    fetchPage(1, pageSize()).then(function(data){
       var sig = sigOf(data.records);
       // 记录变少 = 电脑上清空了 / 上限淘汰了旧条目。此时不能只做增量插入：
       // 消失的条目在 H5 上会一直挂在列表里（prependNewRecords 只增不删），
@@ -626,7 +714,7 @@
       }
     }
     emptyEl.hidden = state.total > 0;
-    countEl.textContent = '共 ' + state.total + ' 条记录';
+    countEl.textContent = countLabel();
   }
 
   // 托盘「设置」/ 快捷键是以 ?settings=1 / ?qr=1 / ?history=1 打开本页的。
@@ -645,6 +733,35 @@
 
   function openModal(){ modal.hidden = false; }
   function closeModal(){ modal.hidden = true; clearAutoParam(); }
+
+  // ── 统一确认弹窗（页面居中）────────────────────────────────
+  // 代替 window.confirm：内置弹窗样式不可控、出现在窗口顶部而不是页面中间，
+  // 也没法统一危险按钮的样式。清空全部文本 / 图片 / 收藏共用这一套。
+  // 返回 Promise<boolean>：确认 = true，取消 / ESC / 点遮罩 = false。
+  var confirmResolve = null;
+  function closeConfirm(ok){
+    if (!confirmResolve) return;
+    var resolve = confirmResolve;
+    confirmResolve = null;
+    confirmModal.hidden = true;
+    resolve(!!ok);
+  }
+  function askConfirm(opts){
+    // 上一个还没关就先当作「取消」，避免旧 Promise 永远悬着
+    if (confirmResolve) closeConfirm(false);
+    confirmTitleEl.textContent = opts.title || '确认操作';
+    confirmTextEl.textContent = opts.message || '';
+    // 确认按钮统一写「确认」，不再按操作定制按钮文案。
+    // 具体操作由标题与说明交代，避免三个弹窗出现三套按钮叫法。
+    confirmOkBtn.textContent = '确认';
+    confirmModal.hidden = false;
+    // 破坏性操作默认焦点放「取消」：连按 Enter 不会误触发
+    try { confirmCancelBtn.focus(); } catch(e){}
+    return new Promise(function(resolve){ confirmResolve = resolve; });
+  }
+  confirmOkBtn.addEventListener('click', function(){ closeConfirm(true); });
+  confirmCancelBtn.addEventListener('click', function(){ closeConfirm(false); });
+  confirmModal.addEventListener('click', function(e){ if (e.target === confirmModal) closeConfirm(false); });
 
   // ── 设置弹窗：通用 / 快捷键 双 tab ────────────────────────
   // 快捷键可自定义：点击组合键框 → 按下新组合 → 松开后回显；保存后服务端
@@ -960,7 +1077,8 @@
     var label = isImage ? '上传图片' : '添加文本';
     addBtn.title = label;
     addBtn.setAttribute('aria-label', label);
-    addBtn.hidden = false;
+    // 收藏是筛选视图，没有「往收藏里添加」这回事
+    addBtn.hidden = state.type === 'favorite';
   }
 
   // ── 悬浮按钮拖动：挡住内容时挪开，位置存 localStorage ──────────
@@ -1154,9 +1272,10 @@
       if (e.key === 'Enter'){ e.preventDefault(); settingsSave.click(); }
     });
   });
-  // ESC 关当前打开的弹窗（设置 > 历史 > 二维码）；正在捕获快捷键时交给捕获逻辑
+  // ESC 关当前打开的弹窗（确认 > 设置 > 历史 > 二维码）；正在捕获快捷键时交给捕获逻辑
   document.addEventListener('keydown', function(e){
     if (e.key !== 'Escape') return;
+    if (!confirmModal.hidden){ closeConfirm(false); return; }
     if (hkCapture) return;
     if (!addTextModal.hidden) closeAddText();
     else if (!settingsModal.hidden) closeSettings();
@@ -1172,25 +1291,57 @@
 
   tabText.addEventListener('click', function(){ switchTab('text'); });
   tabImage.addEventListener('click', function(){ switchTab('image'); });
+  tabFavorite.addEventListener('click', function(){ switchTab('favorite'); });
 
   // 页面右上角设置入口（仅 PC + 本机可见）：与托盘「设置」打开同一个弹窗
   if (settingsBtn) settingsBtn.addEventListener('click', openSettings);
 
   clearBtn.addEventListener('click', function(){
-    var label = state.type === 'image' ? '图片' : '文本';
-    if (!confirm('确定清空全部' + label + '记录？')) return;
-    fetch('/api/clear?type=' + state.type, { method:'POST' }).then(function(r){
-      if (r.ok){
-        toast('已清空全部' + label + '记录');
+    var isImage = state.type === 'image';
+    // 收藏是「这条我要留着」的显式标记，清空历史不会带走它（store.Clear 同语义）
+    askConfirm({
+      title: isImage ? '清空全部图片' : '清空全部文本',
+      message: isImage ? '确定清空全部图片记录？此操作不可撤销。'
+                       : '确定清空全部文本记录？收藏的文本会被保留。'
+    }).then(function(ok){
+      if (!ok) return;
+      fetch('/api/clear?type=' + (isImage ? 'image' : 'text'), { method:'POST' }).then(function(r){
+        if (r.ok){
+          toast(isImage ? '已清空全部图片记录' : '已清空全部文本记录（收藏已保留）');
+          state.page = 1; state.pages = 1; state.sig = ''; state.firstSig = '';
+          loadView(true);
+          return;
+        }
+        // 403 = 手机端无权限；5xx = 落盘失败（服务端 storageError 有具体原因）。
+        r.json().then(function(j){
+          toast(r.status === 403 ? '无权限清空' : (j && j.error) || '清空失败，请稍后重试');
+        }).catch(function(){ toast('清空失败，请稍后重试'); });
+      }).catch(function(){ toast('操作失败'); });
+    });
+  });
+
+  // 收藏页「清空全部收藏」：按钮文案与文本/图片清空保持统一，
+  // 但语义不同——只移除收藏标记、不删除记录（弹窗与 toast 里都写明）。
+  // 与清空共用同一个居中确认弹窗；权限也在服务端按 /api/clear 同一套校验。
+  unfavAllBtn.addEventListener('click', function(){
+    if (state.favorites <= 0){ toast('暂无收藏'); return; }
+    askConfirm({
+      title: '清空全部收藏',
+      message: '确定清空全部 ' + state.favorites + ' 条收藏？记录本身不会删除，只是移除收藏标记。'
+    }).then(function(ok){
+      if (!ok) return;
+      unfavAllBtn.disabled = true;
+      fetch('/api/unfavorite-all', { method: 'POST' }).then(readJSON).then(function(res){
+        unfavAllBtn.disabled = false;
+        if (!res.ok){ toast((res.j && res.j.error) || '操作失败'); return; }
+        toast('已清空全部收藏（记录已保留）');
         state.page = 1; state.pages = 1; state.sig = ''; state.firstSig = '';
         loadView(true);
-        return;
-      }
-      // 403 = 手机端无权限；5xx = 落盘失败（服务端 storageError 有具体原因）。
-      r.json().then(function(j){
-        toast(r.status === 403 ? '无权限清空' : (j && j.error) || '清空失败，请稍后重试');
-      }).catch(function(){ toast('清空失败，请稍后重试'); });
-    }).catch(function(){ toast('操作失败'); });
+      }).catch(function(){
+        unfavAllBtn.disabled = false;
+        toast('操作失败');
+      });
+    });
   });
 
   // 保存设置：保留条数 + 开机自启一起提交，服务端立即生效

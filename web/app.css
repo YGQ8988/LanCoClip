@@ -85,7 +85,7 @@
   }
   .tab{
     appearance:none;-webkit-appearance:none;border:none;background:transparent;color:var(--muted);
-    font-size:14px;font-weight:600;padding:7px 16px;border-radius:10px;cursor:pointer;
+    font-size:14px;font-weight:600;padding:7px 13px;border-radius:10px;cursor:pointer;
     display:inline-flex;align-items:center;gap:6px;transition:background .15s ease,color .15s ease;
   }
   .tab:active{transform:scale(.97);}
@@ -143,6 +143,11 @@
   .btn.danger{background:linear-gradient(135deg,var(--danger),var(--danger2));border-color:transparent;}
   .btn.block{width:100%;justify-content:center;padding:12px;font-size:15px;}
   .btn.done{background:linear-gradient(135deg,#16a34a,#15803d);border-color:transparent;}
+  /* 收藏按钮：已收藏只把文字改成红色；底色/边框/圆角完全沿用 .btn，
+     和旁边的「复制」按钮一模一样，不再另加描边或色块 */
+  .btn.fav.on{color:var(--danger);}
+  :root[data-theme="dark"] .btn.fav.on{color:#f87171;}
+  .btn.fav[disabled]{opacity:.6;cursor:default;}
 
   /* 左右两翼 flex:1 且 flex-basis:0，两侧等宽，tab 永远居中
      （若用 1fr 栅格，左侧计数过宽会把中间挤偏） */
@@ -156,7 +161,7 @@
   /* 手机端隐藏计数：tab 角标已显示同样数字，去掉后 tab 严格居中 */
   body.is-h5 .toolbar .count{display:none;}
 
-  /* 列表：PC 宽屏四列（每页 32 条 = 4 列 × 8 行），窄窗口与 H5 递减列数。
+  /* 列表：PC 宽屏四列（图片每页 8 条 = 4 列 × 2 行），窄窗口与 H5 递减列数。
      align-items:start 让每张卡保持自身高度，不被同行卡片拉伸 */
   .list{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:1fr;gap:8px;align-items:start;}
   .list.cols-4{grid-template-columns:1fr;}
@@ -263,6 +268,11 @@
   .field input:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(59,130,246,.20);}
   .field-hint{font-size:12px;color:var(--muted);line-height:1.5;margin:0 0 18px;}
   .modal-actions{display:flex;gap:10px;}
+  /* 统一确认弹窗：沿用 .modal 的遮罩 + 居中，文案左对齐比居中更好读 */
+  .confirm-card{max-width:330px;text-align:left;}
+  .confirm-card h2{margin-bottom:10px;}
+  .confirm-text{font-size:13.5px;line-height:1.65;color:var(--muted);margin:0 0 20px;overflow-wrap:anywhere;}
+  .confirm-card .modal-actions .btn.danger{color:#fff;}
   /* 顶部状态横幅：暂停记录 / 写盘异常，轮询时自动同步 */
   .notice{margin:0 auto 12px;padding:10px 14px;border-radius:12px;font-size:13px;font-weight:600;
           background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.38);color:var(--text);}

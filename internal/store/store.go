@@ -24,6 +24,11 @@ import (
 const (
 	KindText  = "text"
 	KindImage = "image"
+	// KindFavorite 是「视图类型」而不是 Record.Kind 的取值：收藏项仍然是
+	// 普通文本记录（Record.Favorite=true），只是按收藏标记单独筛选、分页。
+	// 这样收藏天然跟着文本走（同一份数据、同一次落盘），不会出现
+	// 「文本被删了收藏还在 / 两边内容不一致」的双份数据。
+	KindFavorite = "favorite"
 )
 
 // imageNameRE only accepts the file names this program generates:
@@ -80,6 +85,9 @@ type Record struct {
 	Image     string `json:"image,omitempty"`   // image file name inside the images dir
 	ImageSum  string `json:"imageSum,omitempty"`
 	CreatedAt int64  `json:"createdAt"` // unix milliseconds
+	// Favorite 标记文本记录被收藏（只有文本会用到）。收藏项不会被保留条数
+	// 上限自动淘汰，清空历史时也保留——收藏本来就是「这条我要留着」的意思。
+	Favorite bool `json:"favorite,omitempty"`
 }
 
 // Store keeps lancoclip records in memory and mirrors them to disk.
@@ -314,7 +322,7 @@ func (s *Store) load() {
 	// 兜底：settings.json 可能被手工改得比磁盘存量还小，加载时按最旧优先
 	// 修剪一次，保证「不超出上限」的不变量成立（下次落盘即生效）
 	s.mu.Lock()
-	if trimList(&s.texts, s.maxText, nil)+trimList(&s.images, s.maxImage, s.removeImageFile) > 0 {
+	if trimTexts(&s.texts, s.maxText, nil)+trimList(&s.images, s.maxImage, s.removeImageFile) > 0 {
 		s.dirty = true
 	}
 	s.mu.Unlock()
@@ -478,7 +486,7 @@ func (s *Store) AddText(content string) bool {
 	if len(s.texts) > 0 && s.texts[0].Content == content {
 		return false
 	}
-	s.texts = prepend(s.texts, s.newRecord(KindText, content, "", ""), s.maxText, nil)
+	s.texts = prependText(s.texts, s.newRecord(KindText, content, "", ""), s.maxText)
 	s.dirty = true
 	return true
 }
@@ -568,6 +576,14 @@ func prepend(list []Record, r Record, max int, onDrop func(Record)) []Record {
 	return out
 }
 
+// prependText inserts a text record at the head and enforces the text cap
+// without ever dropping a favourite (see trimTexts).
+func prependText(list []Record, r Record, max int) []Record {
+	out := append([]Record{r}, list...)
+	trimTexts(&out, max, nil)
+	return out
+}
+
 // trimList drops the oldest entries (the tail of the newest-first list) until
 // len(list) <= max, reporting how many were removed. onDrop (optional) cleans
 // up files of the dropped records.
@@ -584,6 +600,46 @@ func trimList(list *[]Record, max int, onDrop func(Record)) int {
 	return removed
 }
 
+// trimTexts enforces the text cap but treats favourites as exempt: it only
+// drops the oldest non-favourite records. A favourite is an explicit "keep
+// this" from the user, so silently evicting it when the cap is reached would
+// defeat the feature (and lose the only copy). The list may therefore exceed
+// maxText by the number of favourites.
+func trimTexts(list *[]Record, max int, onDrop func(Record)) int {
+	rs := *list
+	if max < 0 {
+		max = 0
+	}
+	nonFav := 0
+	for i := range rs {
+		if !rs[i].Favorite {
+			nonFav++
+		}
+	}
+	drop := nonFav - max
+	if drop <= 0 {
+		return 0
+	}
+	// 从尾部（最旧）往前扫：遇到非收藏的就淘汰，收藏的一条都不动；
+	// out 收集到的是「最旧→最新」，最后整体翻转回 newest-first。
+	out := make([]Record, 0, len(rs)-drop)
+	for i := len(rs) - 1; i >= 0; i-- {
+		if drop > 0 && !rs[i].Favorite {
+			drop--
+			if onDrop != nil {
+				onDrop(rs[i])
+			}
+			continue
+		}
+		out = append(out, rs[i])
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	*list = out
+	return nonFav - max
+}
+
 func (s *Store) removeImageFile(r Record) {
 	if r.Kind == KindImage && r.Image != "" {
 		_ = os.Remove(filepath.Join(s.imgDir, r.Image))
@@ -592,21 +648,27 @@ func (s *Store) removeImageFile(r Record) {
 
 // Page returns one page of records of the given kind (newest first) plus that
 // kind's total count. page is 1-based; out-of-range pages yield an empty slice.
+// kind 可以是 KindText / KindImage / KindFavorite；收藏只是文本的一个筛选视图。
 func (s *Store) Page(kind string, page, size int) ([]Record, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	list := s.texts
-	if kind == KindImage {
-		list = s.images
-	}
-	total := len(list)
 	if page < 1 {
 		page = 1
 	}
 	if size < 1 {
 		size = 1
 	}
+
+	if kind == KindFavorite {
+		return pageFavorites(s.texts, page, size)
+	}
+
+	list := s.texts
+	if kind == KindImage {
+		list = s.images
+	}
+	total := len(list)
 	// 先用除法判越界，再做乘法：(page-1)*size 在 page 接近 MaxInt 时会静默
 	// 溢出成负数，绕过 start>=total 并在下面的切片表达式里 panic。
 	if int64(page-1) > int64(total)/int64(size) {
@@ -623,6 +685,126 @@ func (s *Store) Page(kind string, page, size int) ([]Record, int) {
 	out := make([]Record, end-start)
 	copy(out, list[start:end])
 	return out, total
+}
+
+// pageFavorites pages over the favourites inside the text list without copying
+// the whole slice: two linear passes (count, then collect) instead of building
+// and sorting a filtered copy on every 2s poll.
+func pageFavorites(texts []Record, page, size int) ([]Record, int) {
+	total := 0
+	for i := range texts {
+		if texts[i].Favorite {
+			total++
+		}
+	}
+	if int64(page-1) > int64(total)/int64(size) {
+		return []Record{}, total
+	}
+	start := (page - 1) * size
+	if start >= total {
+		return []Record{}, total
+	}
+	end := start + size
+	if end > total {
+		end = total
+	}
+	out := make([]Record, 0, end-start)
+	idx := 0
+	for i := range texts {
+		if !texts[i].Favorite {
+			continue
+		}
+		if idx >= start {
+			out = append(out, texts[i])
+		}
+		idx++
+		if idx >= end {
+			break
+		}
+	}
+	return out, total
+}
+
+// FavoriteCount returns how many text records are marked as favourites.
+func (s *Store) FavoriteCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n := 0
+	for i := range s.texts {
+		if s.texts[i].Favorite {
+			n++
+		}
+	}
+	return n
+}
+
+// SetFavorite marks (or unmarks) a text record as a favourite. It reports
+// whether the record exists and whether the flag actually changed, so the
+// HTTP layer can answer 404 / skip a pointless Save.
+func (s *Store) SetFavorite(id int64, fav bool) (found, changed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.texts {
+		if s.texts[i].ID != id {
+			continue
+		}
+		if s.texts[i].Favorite == fav {
+			return true, false
+		}
+		s.texts[i].Favorite = fav
+		s.dirty = true
+		return true, true
+	}
+	return false, false
+}
+
+// UnfavoriteAll removes the favourite flag from every text record and returns
+// the IDs whose flag changed. Records themselves are never deleted: the action
+// only drops the "keep this" marker, so the text list stays intact. The IDs let
+// the HTTP layer roll the in-memory state back via RestoreFavorites when Save
+// fails — otherwise the page would show zero favourites while the on-disk file
+// still has them, and a restart would resurrect them.
+// We deliberately do not re-trim to maxText here: clearing favourites must not
+// silently delete history. The cap converges on the next insert or when the
+// retention settings change (both go through trimTexts).
+func (s *Store) UnfavoriteAll() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ids := make([]int64, 0)
+	for i := range s.texts {
+		if s.texts[i].Favorite {
+			s.texts[i].Favorite = false
+			ids = append(ids, s.texts[i].ID)
+		}
+	}
+	if len(ids) > 0 {
+		s.dirty = true
+	}
+	return ids
+}
+
+// RestoreFavorites re-marks the given IDs as favourites. It is only used to
+// undo an UnfavoriteAll whose Save failed; IDs no longer present are ignored.
+func (s *Store) RestoreFavorites(ids []int64) {
+	if len(ids) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	want := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		want[id] = true
+	}
+	n := 0
+	for i := range s.texts {
+		if want[s.texts[i].ID] && !s.texts[i].Favorite {
+			s.texts[i].Favorite = true
+			n++
+		}
+	}
+	if n > 0 {
+		s.dirty = true
+	}
 }
 
 // RecentMixed returns the n newest records across both kinds (text + image),
@@ -733,7 +915,7 @@ func (s *Store) SetLimits(maxText, maxImage int) (trimmedText, trimmedImage int)
 
 	s.trimStashTexts = nil
 	s.trimStashImages = nil
-	trimmedText = trimList(&s.texts, s.maxText, func(r Record) {
+	trimmedText = trimTexts(&s.texts, s.maxText, func(r Record) {
 		s.trimStashTexts = append(s.trimStashTexts, r)
 	})
 	trimmedImage = trimList(&s.images, s.maxImage, func(r Record) {
@@ -977,8 +1159,19 @@ func (s *Store) Clear(kind string) {
 		s.nextImageID = 1
 	}
 	if kind == "" || kind == KindText {
-		s.texts = nil
-		s.nextTextID = 1
+		// 收藏是用户显式挑出来要留的：清空文本（含「清空全部」）时保留，
+		// 只有「取消收藏」才会让它消失。号段也只在一条不剩时才回到 1，
+		// 否则新记录会和保留下来的收藏撞号。
+		kept := make([]Record, 0, len(s.texts))
+		for _, r := range s.texts {
+			if r.Favorite {
+				kept = append(kept, r)
+			}
+		}
+		s.texts = kept
+		if len(kept) == 0 {
+			s.nextTextID = 1
+		}
 	}
 	s.dirty = true
 }

@@ -1292,3 +1292,167 @@ func TestValidInstanceURL(t *testing.T) {
 		}
 	}
 }
+
+// 收藏接口：切换标记、type=favorite 单独分页、counts 里带收藏数。
+// 收藏是「在已有记录上加标记」，不是清空/改设置那类特权操作，
+// 所以手机端（非本机来源）也允许——这正是它的主要使用场景。
+func TestHandleFavorite(t *testing.T) {
+	s := newTestServer(t)
+	for i := 1; i <= 3; i++ {
+		s.store.AddText(fmt.Sprintf("fav-%d", i))
+	}
+	recs, _ := s.store.Page(store.KindText, 1, 10)
+	target := recs[1] // fav-2
+	idStr := strconv.FormatInt(target.ID, 10)
+
+	rec := serve(s, http.MethodPost, "/api/favorite", "192.168.1.99:5000", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile/15E148",
+		`{"id":`+idStr+`,"favorite":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("favorite = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	if out := decodeJSON(t, rec); out["favorites"] != float64(1) || out["favorite"] != true {
+		t.Fatalf("favorite response = %v", out)
+	}
+
+	list := decodeJSON(t, serve(s, http.MethodGet, "/api/records?type=favorite&page=1&size=28", "192.168.1.99:5000", "", ""))
+	if list["type"] != store.KindFavorite || list["total"] != float64(1) || list["totalPages"] != float64(1) {
+		t.Fatalf("favorite list meta = %v", list)
+	}
+	if got := len(list["records"].([]any)); got != 1 {
+		t.Fatalf("favorite records = %d, want 1", got)
+	}
+	counts, _ := list["counts"].(map[string]any)
+	if counts["favorite"] != float64(1) || counts["text"] != float64(3) {
+		t.Fatalf("counts = %v", counts)
+	}
+
+	// 取消收藏后收藏页为空，文本页仍是 3 条
+	rec = serve(s, http.MethodPost, "/api/favorite", "192.168.1.99:5000", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile/15E148",
+		`{"id":`+idStr+`,"favorite":false}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unfavorite = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	if out := decodeJSON(t, rec); out["favorites"] != float64(0) {
+		t.Fatalf("favorites after unfavorite = %v", out)
+	}
+	if _, total := s.store.Page(store.KindText, 1, 10); total != 3 {
+		t.Fatalf("texts after unfavorite = %d, want 3", total)
+	}
+
+	// 参数校验：不存在的 id → 404；缺字段 / 非 POST → 400 / 405
+	if rec := serve(s, http.MethodPost, "/api/favorite", "127.0.0.1:5000", "", `{"id":9999,"favorite":true}`); rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown id = %d, want 404", rec.Code)
+	}
+	if rec := serve(s, http.MethodPost, "/api/favorite", "127.0.0.1:5000", "", `{"id":1}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing favorite = %d, want 400", rec.Code)
+	}
+	if rec := serve(s, http.MethodGet, "/api/favorite", "127.0.0.1:5000", "", ""); rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET = %d, want 405", rec.Code)
+	}
+}
+
+// 落盘失败时收藏接口不能回 ok:true（与其它写接口同一语义）。
+func TestFavoriteSaveFailure(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	s := &Server{store: st, suppressor: lancoclip.NewSuppressor(), localIPs: map[string]bool{}}
+	st.AddText("keep me")
+	recs, _ := st.Page(store.KindText, 1, 10)
+	idStr := strconv.FormatInt(recs[0].ID, 10)
+
+	// 非空目录挡住 texts.json.tmp 的写入，Save 必败
+	if err := os.Mkdir(filepath.Join(dir, "texts.json.tmp"), 0o700); err != nil {
+		t.Fatalf("mkdir blocker: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "texts.json.tmp", "x"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+	rec := serve(s, http.MethodPost, "/api/favorite", "127.0.0.1:5000", "",
+		`{"id":`+idStr+`,"favorite":true}`)
+	if rec.Code < 500 {
+		t.Fatalf("save failure = %d, want 5xx (%s)", rec.Code, rec.Body.String())
+	}
+	if out := decodeJSON(t, rec); out["ok"] == true {
+		t.Fatalf("save failure returned ok:true: %v", out)
+	}
+}
+
+// 批量取消收藏是特权操作（同 /api/clear）：仅服务本机可用，只清标记不删文本。
+func TestHandleUnfavoriteAll(t *testing.T) {
+	s := newTestServer(t)
+	for i := 1; i <= 3; i++ {
+		s.store.AddText(fmt.Sprintf("fav-%d", i))
+	}
+	recs, _ := s.store.Page(store.KindText, 1, 10)
+	for _, r := range recs[:2] {
+		if found, _ := s.store.SetFavorite(r.ID, true); !found {
+			t.Fatalf("SetFavorite(%d): not found", r.ID)
+		}
+	}
+
+	// 局域网手机端 → 403，收藏标记不动
+	if rec := serve(s, http.MethodPost, "/api/unfavorite-all", "192.168.1.99:5000", "", ""); rec.Code != http.StatusForbidden {
+		t.Fatalf("LAN unfavorite-all = %d, want 403 (%s)", rec.Code, rec.Body.String())
+	}
+	if n := s.store.FavoriteCount(); n != 2 {
+		t.Fatalf("favorites after 403 = %d, want 2", n)
+	}
+	if rec := serve(s, http.MethodGet, "/api/unfavorite-all", "127.0.0.1:5000", "", ""); rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET = %d, want 405", rec.Code)
+	}
+
+	rec := serve(s, http.MethodPost, "/api/unfavorite-all", "127.0.0.1:5000", "", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unfavorite-all = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	if out := decodeJSON(t, rec); out["cleared"] != float64(2) || out["favorites"] != float64(0) {
+		t.Fatalf("response = %v", out)
+	}
+	favList := decodeJSON(t, serve(s, http.MethodGet, "/api/records?type=favorite&page=1&size=28", "127.0.0.1:5000", "", ""))
+	if favList["total"] != float64(0) {
+		t.Fatalf("favorite total = %v, want 0", favList["total"])
+	}
+	textList := decodeJSON(t, serve(s, http.MethodGet, "/api/records?type=text&page=1&size=28", "127.0.0.1:5000", "", ""))
+	if textList["total"] != float64(3) {
+		t.Fatalf("text total = %v, want 3 (records must not be deleted)", textList["total"])
+	}
+	// 幂等：再次调用返回 cleared=0
+	rec = serve(s, http.MethodPost, "/api/unfavorite-all", "127.0.0.1:5000", "", "")
+	if out := decodeJSON(t, rec); out["cleared"] != float64(0) || out["ok"] != true {
+		t.Fatalf("second call = %v", out)
+	}
+}
+
+// 写盘失败时批量取消收藏不能回 ok:true，且内存标记要回滚，避免重启后收藏「复活」。
+func TestUnfavoriteAllSaveFailure(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	s := &Server{store: st, suppressor: lancoclip.NewSuppressor(), localIPs: map[string]bool{}}
+	st.AddText("keep me")
+	recs, _ := st.Page(store.KindText, 1, 10)
+	st.SetFavorite(recs[0].ID, true)
+
+	// 非空目录挡住 texts.json.tmp 的写入，Save 必败
+	if err := os.Mkdir(filepath.Join(dir, "texts.json.tmp"), 0o700); err != nil {
+		t.Fatalf("mkdir blocker: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "texts.json.tmp", "x"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+	rec := serve(s, http.MethodPost, "/api/unfavorite-all", "127.0.0.1:5000", "", "")
+	if rec.Code < 500 {
+		t.Fatalf("save failure = %d, want 5xx (%s)", rec.Code, rec.Body.String())
+	}
+	if out := decodeJSON(t, rec); out["ok"] == true {
+		t.Fatalf("save failure returned ok:true: %v", out)
+	}
+	if n := st.FavoriteCount(); n != 1 {
+		t.Fatalf("favorites after failed save = %d, want 1 (rolled back)", n)
+	}
+}

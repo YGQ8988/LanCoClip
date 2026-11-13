@@ -1017,3 +1017,234 @@ func TestSaveSkipsImagesWhenMetadataUntrusted(t *testing.T) {
 		t.Fatalf("in-memory image records = %d, want 1", images)
 	}
 }
+
+// 收藏是文本记录上的标记：切换、计数、单独分页都只影响这一个字段。
+func TestFavoriteToggleAndPaging(t *testing.T) {
+	st, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	for i := 1; i <= 40; i++ {
+		st.AddText(fmt.Sprintf("item-%02d", i))
+	}
+	all, total := st.Page(KindText, 1, 100)
+	if total != 40 {
+		t.Fatalf("texts = %d, want 40", total)
+	}
+	// 收藏三条：最新、中间、最旧
+	for _, idx := range []int{0, 20, 39} {
+		if found, changed := st.SetFavorite(all[idx].ID, true); !found || !changed {
+			t.Fatalf("SetFavorite(%d) found=%v changed=%v", all[idx].ID, found, changed)
+		}
+	}
+	// 重复收藏同一 ID 不应标记为变更
+	if found, changed := st.SetFavorite(all[0].ID, true); !found || changed {
+		t.Fatalf("idempotent SetFavorite found=%v changed=%v", found, changed)
+	}
+	if n := st.FavoriteCount(); n != 3 {
+		t.Fatalf("FavoriteCount = %d, want 3", n)
+	}
+	// 收藏页每页 2 条：第 1 页 2 条、第 2 页 1 条，且 total 是收藏数而不是文本总数
+	p1, ftotal := st.Page(KindFavorite, 1, 2)
+	if ftotal != 3 || len(p1) != 2 {
+		t.Fatalf("favorite page1 = %d/%d, want 2/3", len(p1), ftotal)
+	}
+	if !p1[0].Favorite || !p1[1].Favorite {
+		t.Fatal("favorite page contains non-favourite records")
+	}
+	if p1[0].Content != "item-40" || p1[1].Content != "item-20" {
+		t.Fatalf("favorite page1 order = %q,%q", p1[0].Content, p1[1].Content)
+	}
+	p2, _ := st.Page(KindFavorite, 2, 2)
+	if len(p2) != 1 || p2[0].Content != "item-01" {
+		t.Fatalf("favorite page2 = %v", p2)
+	}
+	// 取消收藏后收藏页立刻少一条，文本页保持不变
+	if found, changed := st.SetFavorite(all[0].ID, false); !found || !changed {
+		t.Fatalf("unfavorite found=%v changed=%v", found, changed)
+	}
+	if _, ftotal := st.Page(KindFavorite, 1, 10); ftotal != 2 {
+		t.Fatalf("favorites after unfavorite = %d, want 2", ftotal)
+	}
+	if _, total := st.Page(KindText, 1, 100); total != 40 {
+		t.Fatalf("texts changed by unfavorite: %d", total)
+	}
+	// 不存在的 ID：found=false，不改任何状态
+	if found, changed := st.SetFavorite(9999, true); found || changed {
+		t.Fatalf("unknown id found=%v changed=%v", found, changed)
+	}
+	// 收藏标记要能落盘并在重启后恢复（它和文本同文件）
+	if err := st.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	st2, err := NewStore(st.dir)
+	if err != nil {
+		t.Fatalf("NewStore reopen: %v", err)
+	}
+	if n := st2.FavoriteCount(); n != 2 {
+		t.Fatalf("favorites after restart = %d, want 2", n)
+	}
+}
+
+// 收藏不受文本保留条数上限淘汰：用户点了收藏就是「这条我要留着」。
+func TestFavoritesSurviveTextTrim(t *testing.T) {
+	st, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	for i := 1; i <= 15; i++ {
+		st.AddText(fmt.Sprintf("t%02d", i))
+	}
+	all, _ := st.Page(KindText, 1, 20)
+	oldest := all[len(all)-1]
+	if found, _ := st.SetFavorite(oldest.ID, true); !found {
+		t.Fatalf("favorite %d: not found", oldest.ID)
+	}
+
+	// 上限收到 10：只淘汰最旧的非收藏（14 条非收藏 → 10 条），收藏那条保留
+	trimmed, _ := st.SetLimits(10, 5)
+	if trimmed != 4 {
+		t.Fatalf("trimmed = %d, want 4 (favourite must not be trimmed)", trimmed)
+	}
+	texts, total := st.Page(KindText, 1, 20)
+	if total != 11 {
+		t.Fatalf("texts after trim = %d, want 11 (10 non-fav + 1 fav)", total)
+	}
+	found := false
+	for _, r := range texts {
+		if r.ID == oldest.ID {
+			found = r.Favorite
+		}
+	}
+	if !found {
+		t.Fatal("favourite record was trimmed away")
+	}
+	if n := st.FavoriteCount(); n != 1 {
+		t.Fatalf("FavoriteCount after trim = %d, want 1", n)
+	}
+
+	// 再追加新记录：非收藏数量保持在上限内，收藏继续留着
+	st.AddText("t16")
+	if n := st.FavoriteCount(); n != 1 {
+		t.Fatalf("FavoriteCount after add = %d, want 1", n)
+	}
+	if _, total := st.Page(KindText, 1, 30); total != 11 {
+		t.Fatalf("texts after add = %d, want 11", total)
+	}
+}
+
+// 清空文本时保留收藏，且号段不能回退到会跟收藏撞号的位置。
+func TestClearTextKeepsFavorites(t *testing.T) {
+	st, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	for i := 1; i <= 3; i++ {
+		st.AddText(fmt.Sprintf("c%d", i))
+	}
+	all, _ := st.Page(KindText, 1, 10)
+	keep := all[1]
+	if found, _ := st.SetFavorite(keep.ID, true); !found {
+		t.Fatalf("favorite %d: not found", keep.ID)
+	}
+
+	st.Clear(KindText)
+	texts, total := st.Page(KindText, 1, 10)
+	if total != 1 || len(texts) != 1 || texts[0].ID != keep.ID {
+		t.Fatalf("after clear: total=%d records=%v (want only the favourite)", total, texts)
+	}
+	st.AddText("after-clear")
+	texts, total = st.Page(KindText, 1, 10)
+	if total != 2 {
+		t.Fatalf("after add: total=%d, want 2", total)
+	}
+	if texts[0].ID == keep.ID {
+		t.Fatalf("new record reused the favourite's id %d", keep.ID)
+	}
+
+	// 取消收藏后再清空 → 一条不剩，号段归 1
+	if found, _ := st.SetFavorite(keep.ID, false); !found {
+		t.Fatalf("unfavorite %d: not found", keep.ID)
+	}
+	st.Clear(KindText)
+	if total := func() int { _, n := st.Page(KindText, 1, 10); return n }(); total != 0 {
+		t.Fatalf("after clear-all: total=%d, want 0", total)
+	}
+	st.AddText("fresh")
+	if recs, _ := st.Page(KindText, 1, 10); recs[0].ID != 1 {
+		t.Fatalf("first record after empty clear: id=%d, want 1", recs[0].ID)
+	}
+}
+
+// 批量取消收藏：只清标记、不删记录；落盘并重启后仍无收藏，此后清空文本才真的清光。
+func TestUnfavoriteAll(t *testing.T) {
+	dir := t.TempDir()
+	st, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	for i := 1; i <= 5; i++ {
+		st.AddText(fmt.Sprintf("item-%d", i))
+	}
+	all, total := st.Page(KindText, 1, 10)
+	if total != 5 {
+		t.Fatalf("texts = %d, want 5", total)
+	}
+	for _, idx := range []int{0, 2, 4} {
+		if found, changed := st.SetFavorite(all[idx].ID, true); !found || !changed {
+			t.Fatalf("SetFavorite(%d) found=%v changed=%v", all[idx].ID, found, changed)
+		}
+	}
+
+	ids := st.UnfavoriteAll()
+	if len(ids) != 3 {
+		t.Fatalf("UnfavoriteAll ids = %v, want 3", ids)
+	}
+	if n := st.FavoriteCount(); n != 0 {
+		t.Fatalf("FavoriteCount = %d, want 0", n)
+	}
+	if _, n := st.Page(KindFavorite, 1, 10); n != 0 {
+		t.Fatalf("favorite total = %d, want 0", n)
+	}
+	texts, total := st.Page(KindText, 1, 10)
+	if total != 5 {
+		t.Fatalf("texts after unfavorite-all = %d, want 5", total)
+	}
+	for _, r := range texts {
+		if r.Favorite {
+			t.Fatalf("record %d still favourite", r.ID)
+		}
+	}
+	// 幂等：没有收藏时不返回 ID，也不重复标脏
+	if ids := st.UnfavoriteAll(); len(ids) != 0 {
+		t.Fatalf("second UnfavoriteAll = %v, want empty", ids)
+	}
+	// Save 失败回滚用的RestoreFavorites：不存在的 ID 忽略，已有的恢复标记
+	st.RestoreFavorites([]int64{all[0].ID, 9999})
+	if n := st.FavoriteCount(); n != 1 {
+		t.Fatalf("FavoriteCount after restore = %d, want 1", n)
+	}
+	st.RestoreFavorites(nil)
+	if ids := st.UnfavoriteAll(); len(ids) != 1 {
+		t.Fatalf("cleanup UnfavoriteAll = %v, want 1", ids)
+	}
+
+	if err := st.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	st2, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore reopen: %v", err)
+	}
+	if n := st2.FavoriteCount(); n != 0 {
+		t.Fatalf("favorites after restart = %d, want 0", n)
+	}
+	if _, n := st2.Page(KindText, 1, 10); n != 5 {
+		t.Fatalf("texts after restart = %d, want 5", n)
+	}
+	// 标记没了以后，清空文本不再保留任何记录
+	st2.Clear(KindText)
+	if _, n := st2.Page(KindText, 1, 10); n != 0 {
+		t.Fatalf("texts after clear = %d, want 0", n)
+	}
+}
