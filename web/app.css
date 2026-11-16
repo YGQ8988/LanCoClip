@@ -90,10 +90,6 @@
   }
   .tab:active{transform:scale(.97);}
   .tab.active{background:linear-gradient(135deg,var(--primary),var(--primary2));color:#fff;}
-  .tab-badge{font-size:11px;font-weight:600;padding:1px 6px;border-radius:8px;min-width:18px;text-align:center;
-             background:var(--glass-strong);color:var(--muted);}
-  .tab-badge:empty{display:none;}
-  .tab.active .tab-badge{background:rgba(255,255,255,.24);color:#fff;}
   /* 切换卡长度与访问地址卡片严格等宽（--feed-w 由 JS 测量 .share 写入），PC/H5 一致；
      两个 tab 均分整条宽度呈分段控件式布局；tabs 是 toolbar 的 flex item，
      窄窗口下 flex-shrink 自动收缩，不会撑爆工具栏 */
@@ -158,7 +154,8 @@
   .tb-side.right{justify-content:flex-end;gap:12px;}
   .toolbar .tabs{flex:0 0 auto;}
   .toolbar .count{font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-  /* 手机端隐藏计数：tab 角标已显示同样数字，去掉后 tab 严格居中 */
+  /* 手机端隐藏计数：窄屏优先保证 tab 与右翼按钮不挤。tab 角标已移除，
+     条数只在 PC 左翼「共 N 条记录」显示，手机端不显示条数 */
   body.is-h5 .toolbar .count{display:none;}
 
   /* 列表：PC 宽屏四列（图片每页 8 条 = 4 列 × 2 行），窄窗口与 H5 递减列数。

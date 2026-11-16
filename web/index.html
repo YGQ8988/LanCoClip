@@ -43,9 +43,10 @@
       <span class="count" id="count">共 0 条记录</span>
     </span>
     <nav class="tabs" id="tabs" role="tablist" aria-label="记录类型">
-      <button class="tab active" id="tabText" role="tab" aria-selected="true">文本<span class="tab-badge" id="badgeText"></span></button>
-      <button class="tab" id="tabImage" role="tab" aria-selected="false">图片<span class="tab-badge" id="badgeImage"></span></button>
-      <button class="tab" id="tabFavorite" role="tab" aria-selected="false">收藏<span class="tab-badge" id="badgeFavorite"></span></button>
+      <!-- 条数只在左翼「共 N 条记录」显示，tab 上不再重复挂角标 -->
+      <button class="tab active" id="tabText" role="tab" aria-selected="true">文本</button>
+      <button class="tab" id="tabImage" role="tab" aria-selected="false">图片</button>
+      <button class="tab" id="tabFavorite" role="tab" aria-selected="false">收藏</button>
     </nav>
     <!-- 右翼：主题切换 → 设置 → 清空全部（清空在最右端） -->
     <span class="tb-side right">

@@ -25,9 +25,6 @@
   var tabText = document.getElementById('tabText');
   var tabImage = document.getElementById('tabImage');
   var tabFavorite = document.getElementById('tabFavorite');
-  var badgeText = document.getElementById('badgeText');
-  var badgeImage = document.getElementById('badgeImage');
-  var badgeFavorite = document.getElementById('badgeFavorite');
   var themeBtn = document.getElementById('themeBtn');
   var settingsModal = document.getElementById('settingsModal');
   var settingsClose = document.getElementById('settingsClose');
@@ -362,9 +359,9 @@
       btn.textContent = want ? '取消收藏' : '收藏';
       btn.title = want ? '从收藏中移除' : '收藏这条文本';
       btn.classList.toggle('on', want);
+      // favorites 仍要更新：收藏页「清空全部收藏」的置灰与确认文案都读它
       if (typeof res.j.favorites === 'number'){
         state.favorites = res.j.favorites;
-        badgeFavorite.textContent = state.favorites;
       }
       if (!want && state.type === 'favorite'){
         if (li.parentNode) li.parentNode.removeChild(li);
@@ -492,12 +489,10 @@
       }
     }
 
-    // tab 上的数量
+    // 条数统一由左翼「共 N 条记录」显示；只保留收藏总数这个状态值
+    // （收藏页按钮置灰和确认弹窗文案需要），不再往 tab 上写角标。
     if (data.counts){
-      badgeText.textContent = data.counts.text || 0;
-      badgeImage.textContent = data.counts.image || 0;
       state.favorites = data.counts.favorite || 0;
-      badgeFavorite.textContent = state.favorites;
     }
     // 保留条数配置（设置弹窗回填用）
     if (data.settings){
